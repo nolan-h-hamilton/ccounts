@@ -18,5 +18,6 @@ global-exclude __pycache__ .DS_Store *.pyc *.so *.dylib *.dll *.o *.a
 exclude vendor/htslib/config.h
 exclude vendor/htslib/config.mk
 exclude vendor/htslib/config_vars.h
+exclude vendor/htslib/htscodecs.mk
 recursive-include tests *.py *.tsv *.bam *.bai *.sizes *.bedGraph *.md
 recursive-include src/ccounts/assemblies *.chrom.sizes *.md

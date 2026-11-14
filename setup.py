@@ -20,7 +20,7 @@ class BuildNative(build_ext):
         if buildDir.exists():
             shutil.rmtree(buildDir)
         buildDir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(vendorDir, buildDir, ignore=shutil.ignore_patterns("*.o", "*.a", ".git", ".DS_Store", "config.h", "config.mk", "config_vars.h"))
+        shutil.copytree(vendorDir, buildDir, ignore=shutil.ignore_patterns("*.o", "*.a", ".git", ".DS_Store", "config.h", "config.mk", "config_vars.h", "htscodecs.mk"))
         cflags = "-O3 -fvisibility=hidden -fPIC"
         if sys.platform == "darwin":
             target = os.environ.get("MACOSX_DEPLOYMENT_TARGET") or sysconfig.get_config_var("MACOSX_DEPLOYMENT_TARGET")
