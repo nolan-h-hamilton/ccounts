@@ -1,0 +1,12 @@
+__pycache__/
+.pytest_cache/
+*.egg-info/
+*.so
+*.dylib
+*.o
+*.a
+build/
+dist/
+src/ccounts/_native.c
+.DS_Store
+vendor/htslib/config_vars.h

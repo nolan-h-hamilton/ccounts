@@ -1,0 +1,3 @@
+track type=bedGraph
+chr1	10	20	5
+chr1	100	105	3
