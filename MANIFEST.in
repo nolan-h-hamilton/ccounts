@@ -1,8 +1,6 @@
 include LICENSE
-include README.md
 include HTSLIB_LICENSE.txt
 include HTSCODECS_LICENSE.md
-include THIRD_PARTY_LICENSES.md
 include ZLIB_LICENSE.txt
 recursive-include src/ccounts *.pyx *.pxi *.h *.c
 graft vendor/htslib
@@ -19,5 +17,4 @@ exclude vendor/htslib/config.h
 exclude vendor/htslib/config.mk
 exclude vendor/htslib/config_vars.h
 exclude vendor/htslib/htscodecs.mk
-recursive-include tests *.py *.tsv *.bam *.bai *.sizes *.bedGraph *.md
-recursive-include src/ccounts/assemblies *.chrom.sizes *.md
+recursive-include tests *.py *.tsv *.bam *.bai *.sizes *.bedGraph *.h5ad *.txt

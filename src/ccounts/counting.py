@@ -7,11 +7,13 @@ from types import MappingProxyType
 from collections.abc import Mapping
 from functools import wraps
 from threading import RLock
+import warnings
 
 import numpy as np
 
 from .sources import GridSpec, SourceSpec, CountOptions, checkedInteger, resolveSelection, _cellIDs
 from .normalization import LibraryTotals
+from .fragmentLength import FragmentLengthOptions
 
 
 def _locked(method):
@@ -217,11 +219,16 @@ class _H5ADSource:
 
 
 class Reader:
-    def __init__(self, sources, grid, *, threads=1, dtype="float32"):
+    def __init__(self, sources, grid, *, threads=1, dtype="float32", fragmentLengthOptions=None):
         from . import _native
 
         if not isinstance(grid, GridSpec):
             raise TypeError("grid must be GridSpec")
+        if fragmentLengthOptions is None:
+            fragmentLengthOptions = FragmentLengthOptions()
+        if not isinstance(fragmentLengthOptions, FragmentLengthOptions):
+            raise TypeError("fragmentLengthOptions must be FragmentLengthOptions")
+        self.fragmentLengthOptions = fragmentLengthOptions
         self._lock = RLock()
         self.sources = tuple(sources)
         if not self.sources or any(not isinstance(source, SourceSpec) for source in self.sources):
@@ -249,7 +256,7 @@ class Reader:
                     "selectedBarcodes": selected,
                     "selectedCellCount": None if selected is None else len(selected),
                     "readLength": None, "pairedEnd": False,
-                    "fragmentLengthBP": None, "chromosomeRanges": {},
+                    "fragmentLengthBP": None, "fragmentLengthDiagnostics": None, "chromosomeRanges": {},
                     "inferenceRequested": bool(
                         source.countOptions is not None and source.countOptions.inferFragmentLength),
                     "inferenceUsed": False,
@@ -294,7 +301,11 @@ class Reader:
                         if options.inferFragmentLength:
                             if mode == "fragments":
                                 raise ValueError("Fragment spans cannot infer read extension")
-                            length = int(handle.estimateFragmentLength(options))
+                            diagnostics = handle.estimateFragmentLength(options, self.fragmentLengthOptions)
+                            length = int(diagnostics["estimateBP"])
+                            info["fragmentLengthDiagnostics"] = diagnostics
+                            if diagnostics["warnings"]:
+                                warnings.warn(". ".join(diagnostics["warnings"]), RuntimeWarning, stacklevel=2)
                             if length <= 0:
                                 raise ValueError("Fragment-length inference requires an explicit positive result")
                             options = replace(options, inferFragmentLength=False,
@@ -376,6 +387,7 @@ class Reader:
         info["countOptions"] = replace(
             info["countOptions"], extendFrom5pBP=length, inferFragmentLength=False)
         info["fragmentLengthBP"] = length
+        info["fragmentLengthDiagnostics"] = None
         info["chromosomeRanges"].clear()
         self._totals.clear()
 
@@ -386,7 +398,12 @@ class Reader:
             raise ValueError("Fragment-length estimation requires a BAM source")
         info = self._info[sampleID]
         if info["fragmentLengthBP"] is None:
-            value = int(self._handles[sampleID].estimateFragmentLength(info["countOptions"]))
+            diagnostics = self._handles[sampleID].estimateFragmentLength(
+                info["countOptions"], self.fragmentLengthOptions)
+            value = int(diagnostics["estimateBP"])
+            info["fragmentLengthDiagnostics"] = diagnostics
+            if diagnostics["warnings"]:
+                warnings.warn(". ".join(diagnostics["warnings"]), RuntimeWarning, stacklevel=2)
             if value <= 0:
                 raise ValueError("Fragment-length estimation failed")
             info["fragmentLengthBP"] = value
@@ -558,5 +575,5 @@ class Reader:
         return result
 
 
-def openSources(sources, grid, *, threads=1, dtype="float32"):
-    return Reader(sources, grid, threads=threads, dtype=dtype)
+def openSources(sources, grid, *, threads=1, dtype="float32", fragmentLengthOptions=None):
+    return Reader(sources, grid, threads=threads, dtype=dtype, fragmentLengthOptions=fragmentLengthOptions)

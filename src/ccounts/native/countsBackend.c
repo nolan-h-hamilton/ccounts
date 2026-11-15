@@ -650,39 +650,6 @@ int ccInspect(ccSource *source, const ccOptions *options, int maxRecords,
     return 0;
 }
 
-int ccFragmentLengths(ccSource *source, const ccOptions *options, int maxRecords,
-                      int64_t *lengths, int *count, const char **error) {
-    int t, status, accepted;
-    int64_t length;
-    bam1_t *record;
-    hts_itr_t *iterator;
-    *count = 0;
-    if (source->kind != 0) return ccFail(error, "fragment-length inference requires BAM");
-    record = bam_init1();
-    if (!record) return ccFail(error, "failed BAM record allocation");
-    for (t = 0; t < source->nameCount && *count < maxRecords; ++t) {
-        iterator = sam_itr_queryi(source->index, t, 0, sam_hdr_tid2len(source->header, t));
-        if (!iterator) { bam_destroy1(record); return ccFail(error, "failed fragment-length query"); }
-        while (*count < maxRecords && (status = sam_itr_next(source->file, iterator, record)) >= 0) {
-            accepted = ccBasicRecord(source, record, options, error);
-            if (accepted < 0) { hts_itr_destroy(iterator); bam_destroy1(record); return -1; }
-            if (!accepted || !(record->core.flag & BAM_FPROPER_PAIR) ||
-                !(record->core.flag & BAM_FREAD1) || (record->core.flag & BAM_FMUNMAP) ||
-                record->core.mtid != record->core.tid) continue;
-            length = record->core.isize;
-            if (length == INT64_MIN) { hts_itr_destroy(iterator); bam_destroy1(record); return ccFail(error, "template length exceeds signed native range"); }
-            if (length < 0) length = -length;
-            if (length <= 0 || length < options->minTemplateLengthBP ||
-                (options->maxTemplateLengthBP > 0 && length > options->maxTemplateLengthBP)) continue;
-            lengths[(*count)++] = length;
-        }
-        hts_itr_destroy(iterator);
-        if (*count < maxRecords && status < -1) { bam_destroy1(record); return ccFail(error, "failed fragment-length read"); }
-    }
-    bam_destroy1(record);
-    return 0;
-}
-
 static int ccSourceRangeInt64Field(
     const char *fieldStart,
     size_t fieldLength,
@@ -1092,31 +1059,115 @@ int ccChromRange(ccSource *source, const char *chromosome, int64_t chromosomeLen
     return status;
 }
 
-int ccStrandPositions(ccSource *source, const char *chromosome, int64_t start,
-                      int64_t end, const ccOptions *options, double *forward,
-                      double *reverse, const char **error) {
-    int tid, status, accepted;
-    int64_t p;
+static int ccEndpointCompare(const void *left, const void *right) {
+    int64_t a = *(const int64_t *)left;
+    int64_t b = *(const int64_t *)right;
+    return (a > b) - (a < b);
+}
+
+int ccBlockEndpoints(ccSource *source, const char *chromosome, int64_t start,
+                     int64_t end, const ccOptions *options, int64_t **forward,
+                     int64_t **reverse, size_t *nF, size_t *nR,
+                     ccEndpointCounts *counts, const char **error) {
+    int tid, status, accepted, strand;
+    int64_t position;
+    int64_t *endpoints[2] = {NULL, NULL};
+    int64_t *grown;
+    size_t capacity[2] = {0, 0}, count[2] = {0, 0};
+    size_t nextCapacity, i, uniqueCount;
     bam1_t *record;
     hts_itr_t *iterator;
-    if (source->kind != 0) return ccFail(error, "strand tracks require BAM");
+    *forward = NULL;
+    *reverse = NULL;
+    *nF = 0;
+    *nR = 0;
+    memset(counts, 0, sizeof(*counts));
+    if (source->kind != 0) return ccFail(error, "block endpoints require BAM");
     tid = sam_hdr_name2tid(source->header, chromosome);
-    if (tid < 0) return 0;
+    if (tid < 0) return ccFail(error, "unknown block chromosome");
+    if (start < 0 || end <= start || end > sam_hdr_tid2len(source->header, tid))
+        return ccFail(error, "invalid endpoint block coordinates");
     iterator = sam_itr_queryi(source->index, tid, start, end);
-    if (!iterator) return ccFail(error, "failed strand-track query");
+    if (!iterator) return ccFail(error, "failed endpoint block query");
     record = bam_init1();
     if (!record) { hts_itr_destroy(iterator); return ccFail(error, "failed BAM record allocation"); }
     while ((status = sam_itr_next(source->file, iterator, record)) >= 0) {
+        ++counts->queriedRecords;
+        if ((record->core.flag & (options->flagExclude | BAM_FUNMAP)) || record->core.tid < 0) {
+            ++counts->excludedFlags;
+            continue;
+        }
+        if (record->core.qual < options->minMappingQuality) {
+            ++counts->excludedMappingQuality;
+            continue;
+        }
         accepted = ccBasicRecord(source, record, options, error);
         if (accepted < 0) { status = -2; break; }
-        if (!accepted) continue;
-        p = (record->core.flag & BAM_FREVERSE) ? bam_endpos(record) - 1 : record->core.pos;
-        if (p < start || p >= end) continue;
-        if (record->core.flag & BAM_FREVERSE) reverse[p - start] += 1;
-        else forward[p - start] += 1;
+        if (!accepted) { ++counts->excludedSelection; continue; }
+        strand = (record->core.flag & BAM_FREVERSE) != 0;
+        if (strand) {
+            if (bam_cigar2rlen(record->core.n_cigar, bam_get_cigar(record)) <= 0) {
+                ccFail(error, "a retained reverse alignment has no reference-consuming span");
+                status = -2;
+                break;
+            }
+            position = bam_endpos(record);
+            if (position <= start || position > end) {
+                ++counts->outsideEndpointOwnership;
+                continue;
+            }
+        } else {
+            position = record->core.pos;
+            if (position < start || position >= end) {
+                ++counts->outsideEndpointOwnership;
+                continue;
+            }
+        }
+        if (count[strand] == capacity[strand]) {
+            if (capacity[strand] > SIZE_MAX / sizeof(int64_t) / 2) {
+                ccFail(error, "endpoint buffer exceeds native allocation range");
+                status = -2;
+                break;
+            }
+            nextCapacity = capacity[strand] ? capacity[strand] * 2 : 1024;
+            grown = realloc(endpoints[strand], nextCapacity * sizeof(int64_t));
+            if (!grown) {
+                ccFail(error, "failed endpoint buffer allocation");
+                status = -2;
+                break;
+            }
+            endpoints[strand] = grown;
+            capacity[strand] = nextCapacity;
+        }
+        endpoints[strand][count[strand]++] = position - start;
     }
-    bam_destroy1(record); hts_itr_destroy(iterator);
-    if (status < -1) return *error ? -1 : ccFail(error, "failed strand-track read");
+    bam_destroy1(record);
+    hts_itr_destroy(iterator);
+    if (status < -1) {
+        free(endpoints[0]);
+        free(endpoints[1]);
+        return *error ? -1 : ccFail(error, "failed endpoint block read");
+    }
+    counts->preDedupForwardRecords = count[0];
+    counts->preDedupReverseRecords = count[1];
+    for (strand = 0; strand < 2; ++strand) {
+        if (count[strand] > 1)
+            qsort(endpoints[strand], count[strand], sizeof(int64_t), ccEndpointCompare);
+        uniqueCount = 0;
+        for (i = 0; i < count[strand]; ++i) {
+            if (i == 0 || endpoints[strand][i] != endpoints[strand][i - 1])
+                endpoints[strand][uniqueCount++] = endpoints[strand][i];
+        }
+        count[strand] = uniqueCount;
+    }
+    counts->retainedForwardEndpoints = count[0];
+    counts->retainedReverseEndpoints = count[1];
+    counts->removedForwardCoordinateDuplicates = counts->preDedupForwardRecords - count[0];
+    counts->removedReverseCoordinateDuplicates = counts->preDedupReverseRecords - count[1];
+    *forward = endpoints[0];
+    *reverse = endpoints[1];
+    *nF = count[0];
+    *nR = count[1];
     return 0;
 }
 
@@ -1152,31 +1203,5 @@ int ccBuildIndex(const char *path, int kind, const char *targetPath,
     if (status < -1 || closed != 0) return ccFail(error, "failed bedGraph compression");
     if (tbx_index_build3(targetPath, NULL, 0, threads, &tbx_conf_bed) != 0)
         return ccFail(error, "failed bedGraph index build");
-    return 0;
-}
-
-int ccDensity(ccSource *source, const char *chromosome, int64_t binSize,
-              const ccOptions *options, double *density, size_t count,
-              const char **error) {
-    int tid, status, accepted;
-    int64_t bin;
-    bam1_t *record;
-    hts_itr_t *iterator;
-    if (source->kind != 0) return ccFail(error, "strand density requires BAM");
-    tid = sam_hdr_name2tid(source->header, chromosome);
-    if (tid < 0) return 0;
-    iterator = sam_itr_queryi(source->index, tid, 0, sam_hdr_tid2len(source->header, tid));
-    if (!iterator) return ccFail(error, "failed density query");
-    record = bam_init1();
-    if (!record) { hts_itr_destroy(iterator); return ccFail(error, "failed BAM record allocation"); }
-    while ((status = sam_itr_next(source->file, iterator, record)) >= 0) {
-        accepted = ccBasicRecord(source, record, options, error);
-        if (accepted < 0) { status = -2; break; }
-        if (!accepted) continue;
-        bin = record->core.pos / binSize;
-        if (bin >= 0 && (size_t)bin < count) density[bin] += 1;
-    }
-    bam_destroy1(record); hts_itr_destroy(iterator);
-    if (status < -1) return *error ? -1 : ccFail(error, "failed density read");
     return 0;
 }
