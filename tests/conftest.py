@@ -13,9 +13,12 @@ def countSources(tmp_path_factory):
         "sizes": str(dataPath / "genome.sizes"),
         "bedGraph": str(dataPath / "signal.bedGraph"),
     }
+
     for name in ("events", "barcodes", "cancellation", "precision"):
         path = indexedPath / f"{name}.fragments.tsv.gz"
+
         pysam.tabix_compress(str(dataPath / f"{name}.fragments.tsv"), str(path))
         pysam.tabix_index(str(path), preset="bed")
         sources[name] = str(path)
+
     return sources

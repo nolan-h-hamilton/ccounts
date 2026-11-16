@@ -1,19 +1,35 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import MappingProxyType
 from collections.abc import Mapping
 from functools import wraps
 from threading import RLock
+from time import perf_counter
 import warnings
 
 import numpy as np
 
-from .sources import GridSpec, SourceSpec, CountOptions, checkedInteger, resolveSelection, _cellIDs
+from .sources import (
+    GridSpec,
+    CountOptions,
+    resolveSelection,
+    _cellIDs,
+)
+from .checks import checkedInteger, selectedSamples, checkCountValues, checkOutputArray
+from .exceptions import (
+    EstimateError,
+    EstimateWarning,
+    InputError,
+    NativeError,
+    NumericalError,
+    SourceError,
+)
 from .normalization import LibraryTotals
 from .fragmentLength import FragmentLengthOptions
+from .lengthScale import LengthScaleOptions, _estimateLengthScale
 
 
 def _locked(method):
@@ -21,6 +37,7 @@ def _locked(method):
     def call(self, *args, **kwargs):
         with self._lock:
             return method(self, *args, **kwargs)
+
     return call
 
 
@@ -42,29 +59,30 @@ class CountBlock:
         count = (end - start + self.grid.binSizeBP - 1) // self.grid.binSizeBP
         sampleIDs = tuple(self.sampleIDs)
         if not sampleIDs or len(set(sampleIDs)) != len(sampleIDs):
-            raise ValueError("CountBlock requires unique sampleIDs")
+            raise InputError(kind="identifiers")
         if (
             not isinstance(self.values, np.ndarray)
             or self.values.shape != (len(sampleIDs), count)
             or self.values.dtype not in (np.dtype("float32"), np.dtype("float64"))
             or not self.values.flags.c_contiguous
         ):
-            raise ValueError("CountBlock values must match the source/bin grid")
+            raise InputError(kind="array")
         if len(self.units) != len(sampleIDs) or len(self.countModes) != len(sampleIDs):
-            raise ValueError("CountBlock metadata must match source rows")
+            raise InputError(kind="array")
         if self.rawNoiseMass is not None and (
             self.rawNoiseMass.shape != self.values.shape
             or self.rawNoiseMass.dtype != self.values.dtype
             or not self.rawNoiseMass.flags.c_contiguous
         ):
-            raise ValueError("rawNoiseMass must match count shape, dtype, and layout")
+            raise InputError(kind="array")
         available = self.noiseAvailable
         if available is None:
             available = (self.rawNoiseMass is not None,) * len(sampleIDs)
         if len(available) != len(sampleIDs):
-            raise ValueError("Noise availability must match source rows")
+            raise InputError(kind="array")
         if self.rawNoiseMass is None and any(available):
-            raise ValueError("Noise availability requires a rawNoiseMass array")
+            raise InputError(kind="array")
+
         object.__setattr__(self, "sampleIDs", sampleIDs)
         object.__setattr__(self, "units", tuple(self.units))
         object.__setattr__(self, "countModes", tuple(self.countModes))
@@ -79,74 +97,101 @@ class _H5ADSource:
         self.handle = h5py.File(source.path, "r")
         self.slices = {}
         try:
-            if "var" not in self.handle or "obs" not in self.handle or "X" not in self.handle:
-                raise ValueError("H5AD requires X, obs, and var")
+            if (
+                "var" not in self.handle
+                or "obs" not in self.handle
+                or "X" not in self.handle
+            ):
+                raise SourceError(kind="metadata")
             frame = read_elem(self.handle["var"])
             if not {"chrom", "start", "end"}.issubset(frame.columns):
-                raise ValueError("H5AD var requires chrom/start/end")
+                raise SourceError(kind="metadata")
             chromosomes = np.asarray(frame["chrom"])
             starts = np.asarray(frame["start"])
             ends = np.asarray(frame["end"])
             if (
-                not len(frame) or starts.dtype.kind not in "iu" or ends.dtype.kind not in "iu"
-                or np.any(starts < 0) or np.any(ends <= starts)
+                not len(frame)
+                or starts.dtype.kind not in "iu"
+                or ends.dtype.kind not in "iu"
+                or np.any(starts < 0)
+                or np.any(ends <= starts)
             ):
-                raise ValueError("H5AD genomic coordinates must be valid integers")
+                raise InputError(kind="grid")
+
             for chromosome in dict.fromkeys(chromosomes):
                 if chromosome not in grid.chromosomeSizes:
-                    raise ValueError(f"H5AD chromosome absent from grid: {chromosome}")
+                    raise SourceError(kind="missing", context=chromosome)
                 indices = np.flatnonzero(chromosomes == chromosome)
                 left, right = int(indices[0]), int(indices[-1]) + 1
                 if right - left != indices.size:
-                    raise ValueError("H5AD chromosome bins must be contiguous")
+                    raise InputError(kind="grid")
                 length = grid.chromosomeSizes[chromosome]
                 expected = np.arange(0, length, grid.binSizeBP, dtype=np.int64)
                 if (
-                    expected.size != indices.size or not np.array_equal(starts[left:right], expected)
-                    or not np.array_equal(ends[left:right], np.minimum(expected + grid.binSizeBP, length))
+                    expected.size != indices.size
+                    or not np.array_equal(starts[left:right], expected)
+                    or not np.array_equal(
+                        ends[left:right], np.minimum(expected + grid.binSizeBP, length)
+                    )
                 ):
-                    raise ValueError("H5AD bins must equal the chromosome-origin grid")
+                    raise InputError(kind="grid")
                 self.slices[chromosome] = (left, right)
+
             obs = read_elem(self.handle["obs"])
-            descriptor = source.selection if isinstance(source.selection, Mapping) else {}
+            descriptor = (
+                source.selection if isinstance(source.selection, Mapping) else {}
+            )
             metadataPath = descriptor.get("path")
             externalMetadata = (
                 metadataPath is not None
                 and Path(metadataPath).resolve() != Path(source.path).resolve()
             )
-            barcodeColumn = None if externalMetadata else descriptor.get("barcodeColumn")
+            barcodeColumn = (
+                None if externalMetadata else descriptor.get("barcodeColumn")
+            )
             if barcodeColumn is not None and barcodeColumn not in obs:
-                raise ValueError(f"Missing H5AD cell identifier column {barcodeColumn}")
+                raise SourceError(kind="metadata", context=barcodeColumn)
             barcodes = obs.index if barcodeColumn is None else obs[barcodeColumn]
             selected = np.ones(len(obs), dtype=bool)
             sampleColumn = descriptor.get("sampleColumn")
-            if sampleColumn is not None and (not externalMetadata or not barcodes.is_unique):
+            if sampleColumn is not None and (
+                not externalMetadata or not barcodes.is_unique
+            ):
                 if sampleColumn not in obs:
-                    raise ValueError(f"Missing H5AD selection column {sampleColumn}")
-                selected &= np.asarray(obs[sampleColumn] == descriptor.get("sampleValue", source.sampleID))
+                    raise SourceError(kind="metadata", context=sampleColumn)
+                selected &= np.asarray(
+                    obs[sampleColumn] == descriptor.get("sampleValue", source.sampleID)
+                )
             groups = descriptor.get("groups")
             if groups is not None and descriptor.get("path") is None:
                 groupColumn = descriptor.get("groupColumn")
                 if groupColumn not in obs:
-                    raise ValueError("H5AD group selection requires groupColumn")
+                    raise SourceError(kind="metadata")
                 selected &= np.asarray(obs[groupColumn].isin(groups))
             if selectedBarcodes is not None:
                 selected &= np.asarray(barcodes.isin(selectedBarcodes))
             self.rows = np.flatnonzero(selected)
             selectedIDs = _cellIDs(barcodes[selected])
             if source.matrixRows == "pseudobulks" and self.rows.size > 1:
-                raise ValueError("A pseudobulk source selects at most one row")
+                raise InputError(kind="selection")
+
             node = self.handle["X"]
             if isinstance(node, h5py.Dataset):
                 self.matrix = node
             else:
                 if node.attrs.get("encoding-type") not in ("csr_matrix", "csc_matrix"):
-                    raise ValueError("H5AD X must be dense, CSR, or CSC")
+                    raise SourceError(kind="metadata")
                 self.matrix = sparse_dataset(node)
-            if self.matrix.shape != (len(obs), len(frame)) or self.matrix.dtype.kind not in "iuf":
-                raise ValueError("H5AD matrix shape or dtype is invalid")
+            if (
+                self.matrix.shape != (len(obs), len(frame))
+                or self.matrix.dtype.kind not in "iuf"
+            ):
+                raise InputError(kind="array")
+
             self.selectedBarcodes = frozenset(selectedIDs)
-            self.selectedCellCount = self.rows.size if source.matrixRows == "cells" else None
+            self.selectedCellCount = (
+                self.rows.size if source.matrixRows == "cells" else None
+            )
             self.grid = grid
         except BaseException:
             self.handle.close()
@@ -157,21 +202,23 @@ class _H5ADSource:
 
     def _blocks(self, chromosome, startBP, endBP):
         if chromosome not in self.slices:
-            raise ValueError(f"H5AD lacks chromosome {chromosome}")
+            raise SourceError(kind="missing", context=chromosome)
         base = self.slices[chromosome][0]
         left = base + startBP // self.grid.binSizeBP
         right = base + (endBP + self.grid.binSizeBP - 1) // self.grid.binSizeBP
         storage = getattr(self.matrix, "format", None)
         if storage == "csr":
             for rowStart in range(0, self.rows.size, 1024):
-                rows = self.rows[rowStart:rowStart + 1024]
+                rows = self.rows[rowStart : rowStart + 1024]
                 yield 0, self.matrix[rows, left:right]
             return
         for columnStart in range(left, right, 4096):
             columnEnd = min(columnStart + 4096, right)
-            columns = self.matrix[:, columnStart:columnEnd] if storage == "csc" else None
+            columns = (
+                self.matrix[:, columnStart:columnEnd] if storage == "csc" else None
+            )
             for rowStart in range(0, self.rows.size, 1024):
-                rows = self.rows[rowStart:rowStart + 1024]
+                rows = self.rows[rowStart : rowStart + 1024]
                 if storage == "csc":
                     block = columns[rows]
                 else:
@@ -183,64 +230,58 @@ class _H5ADSource:
         from scipy import sparse
 
         values = block.data if sparse.issparse(block) else np.asarray(block)
-        if values.dtype.kind == "f":
-            if not np.all(np.isfinite(values)) or np.any(values != np.floor(values)):
-                raise ValueError("H5AD selected X values must be finite nonnegative integers")
-        if np.any(values < 0):
-            raise ValueError("H5AD selected X values must be finite nonnegative integers")
-        return values
+        return checkCountValues(values)
 
     def count(self, chromosome, startBP, endBP):
         count = (endBP - startBP + self.grid.binSizeBP - 1) // self.grid.binSizeBP
         result = np.zeros(count, dtype=np.float64)
-        try:
-            with np.errstate(over="raise", invalid="raise"):
-                for offset, block in self._blocks(chromosome, startBP, endBP):
-                    self._checkedValues(block)
-                    sums = np.asarray(block.sum(axis=0, dtype=np.float64)).reshape(-1)
-                    result[offset:offset + block.shape[1]] += sums
-        except FloatingPointError as error:
-            raise ValueError("H5AD counts exceed float64") from error
+
+        with np.errstate(over="raise", invalid="raise"):
+            for offset, block in self._blocks(chromosome, startBP, endBP):
+                self._checkedValues(block)
+                sums = np.asarray(block.sum(axis=0, dtype=np.float64)).reshape(-1)
+                result[offset : offset + block.shape[1]] += sums
+
         return result
 
     def libraryTotal(self, chromosomes):
         total = 0.0
-        try:
-            with np.errstate(over="raise", invalid="raise"):
-                for chromosome in chromosomes:
-                    for _, block in self._blocks(chromosome, 0, self.grid.chromosomeSizes[chromosome]):
-                        values = self._checkedValues(block)
-                        total += float(np.sum(values, dtype=np.float64))
-        except FloatingPointError as error:
-            raise ValueError("H5AD library total exceeds float64") from error
+
+        with np.errstate(over="raise", invalid="raise"):
+            for chromosome in chromosomes:
+                for _, block in self._blocks(
+                    chromosome, 0, self.grid.chromosomeSizes[chromosome]
+                ):
+                    values = self._checkedValues(block)
+                    total += float(np.sum(values, dtype=np.float64))
         if not np.isfinite(total):
-            raise ValueError("H5AD library total exceeds float64")
+            raise NumericalError()
+
         return total
 
 
 class Reader:
-    def __init__(self, sources, grid, *, threads=1, dtype="float32", fragmentLengthOptions=None):
+    def __init__(
+        self, sources, grid, *, threads=1, dtype="float32", fragmentLengthOptions=None
+    ):
         from . import _native
 
-        if not isinstance(grid, GridSpec):
-            raise TypeError("grid must be GridSpec")
         if fragmentLengthOptions is None:
             fragmentLengthOptions = FragmentLengthOptions()
-        if not isinstance(fragmentLengthOptions, FragmentLengthOptions):
-            raise TypeError("fragmentLengthOptions must be FragmentLengthOptions")
         self.fragmentLengthOptions = fragmentLengthOptions
         self._lock = RLock()
         self.sources = tuple(sources)
-        if not self.sources or any(not isinstance(source, SourceSpec) for source in self.sources):
-            raise ValueError("sources must be a nonempty sequence of SourceSpec")
+        if not self.sources:
+            raise SourceError()
         self.sampleIDs = tuple(source.sampleID for source in self.sources)
         if len(set(self.sampleIDs)) != len(self.sampleIDs):
-            raise ValueError("Source sampleIDs must be unique")
+            raise InputError(kind="identifiers")
         self.grid = grid
         self.threads = checkedInteger(threads, "threads", 1, 65535)
         self.dtype = np.dtype(dtype)
         if self.dtype not in (np.dtype("float32"), np.dtype("float64")):
-            raise ValueError("Reader dtype must be float32 or float64")
+            raise InputError(kind="array")
+
         self._handles = {}
         self._info = {}
         self._readLengthFlags = {}
@@ -248,17 +289,25 @@ class Reader:
         self._totals = {}
         self._closed = False
         self._selectionDir = TemporaryDirectory(prefix="countsCells_")
+        qualityWarning = False
+
         try:
             for index, source in enumerate(self.sources):
                 selected = resolveSelection(source)
                 info = {
-                    "path": source.path, "sourceKind": source.sourceKind,
+                    "path": source.path,
+                    "sourceKind": source.sourceKind,
                     "selectedBarcodes": selected,
                     "selectedCellCount": None if selected is None else len(selected),
-                    "readLength": None, "pairedEnd": False,
-                    "fragmentLengthBP": None, "fragmentLengthDiagnostics": None, "chromosomeRanges": {},
+                    "readLength": None,
+                    "pairedEnd": False,
+                    "fragmentLengthBP": None,
+                    "fragmentLengthDiagnostics": None,
+                    "chromosomeRanges": {},
                     "inferenceRequested": bool(
-                        source.countOptions is not None and source.countOptions.inferFragmentLength),
+                        source.countOptions is not None
+                        and source.countOptions.inferFragmentLength
+                    ),
                     "inferenceUsed": False,
                     "inferenceStatus": "notRequested",
                 }
@@ -274,11 +323,19 @@ class Reader:
                 else:
                     allowPath = ""
                     if selected is not None:
-                        allowPath = str(Path(self._selectionDir.name) / f"source{index}.txt")
-                        Path(allowPath).write_text("".join(f"{barcode}\n" for barcode in sorted(selected)))
+                        allowPath = str(
+                            Path(self._selectionDir.name) / f"source{index}.txt"
+                        )
+                        Path(allowPath).write_text(
+                            "".join(f"{barcode}\n" for barcode in sorted(selected))
+                        )
+
                     handle = _native.NativeSource(
-                        source.path, source.sourceKind, dict(grid.chromosomeSizes),
-                        barcodeAllowListFile=allowPath, barcodeTag=source.barcodeTag,
+                        source.path,
+                        source.sourceKind,
+                        dict(grid.chromosomeSizes),
+                        barcodeAllowListFile=allowPath,
+                        barcodeTag=source.barcodeTag,
                         threads=self.threads,
                     )
                     self._handles[source.sampleID] = handle
@@ -288,28 +345,40 @@ class Reader:
                         mode = options.bamInputMode
                         if mode == "auto":
                             mode = "fragments" if paired else "reads"
+
                         inspectionFlags = options.flagExclude
                         if selected is not None:
-                            inspectionFlags |= 136 if mode == "read1" else (128 if mode == "fragments" else 0)
+                            inspectionFlags |= (
+                                136
+                                if mode == "read1"
+                                else (128 if mode == "fragments" else 0)
+                            )
                         self._readLengthFlags[source.sampleID] = inspectionFlags
                         flags = options.flagExclude | (136 if mode == "read1" else 0)
                         infer = options.inferFragmentLength and mode != "fragments"
                         if options.inferFragmentLength and not infer:
                             info["inferenceStatus"] = "observedTemplate"
-                        options = replace(options, bamInputMode=mode, flagExclude=flags,
-                                          inferFragmentLength=infer)
+                        options = replace(
+                            options,
+                            bamInputMode=mode,
+                            flagExclude=flags,
+                            inferFragmentLength=infer,
+                        )
                         if options.inferFragmentLength:
-                            if mode == "fragments":
-                                raise ValueError("Fragment spans cannot infer read extension")
-                            diagnostics = handle.estimateFragmentLength(options, self.fragmentLengthOptions)
+                            diagnostics = handle.estimateFragmentLength(
+                                options, self.fragmentLengthOptions
+                            )
                             length = int(diagnostics["estimateBP"])
                             info["fragmentLengthDiagnostics"] = diagnostics
                             if diagnostics["warnings"]:
-                                warnings.warn(". ".join(diagnostics["warnings"]), RuntimeWarning, stacklevel=2)
+                                qualityWarning = True
                             if length <= 0:
-                                raise ValueError("Fragment-length inference requires an explicit positive result")
-                            options = replace(options, inferFragmentLength=False,
-                                              extendFrom5pBP=length)
+                                raise EstimateError()
+                            options = replace(
+                                options,
+                                inferFragmentLength=False,
+                                extendFrom5pBP=length,
+                            )
                             info["fragmentLengthBP"] = length
                             info["inferenceUsed"] = True
                             info["inferenceStatus"] = "inferred"
@@ -317,22 +386,28 @@ class Reader:
                     elif source.sourceKind == "FRAGMENTS":
                         options = replace(options, bamInputMode="reads")
                     else:
-                        options = CountOptions(countMode="coverage", bamInputMode="reads")
+                        options = CountOptions(
+                            countMode="coverage", bamInputMode="reads"
+                        )
+
                     info["chromosomeNames"] = tuple(handle.chromosomeNames)
                     info["chromosomeSizes"] = dict(handle.chromosomeSizes)
-                    if source.sourceKind == "BAM":
-                        for chromosome, length in grid.chromosomeSizes.items():
-                            if chromosome in info["chromosomeSizes"] and info["chromosomeSizes"][chromosome] != length:
-                                raise ValueError(f"BAM chromosome length conflicts with grid: {chromosome}")
                     info["countOptions"] = options
                     info["countMode"] = options.countMode
                     info["unit"] = (
-                        "signalMean" if source.sourceKind == "BEDGRAPH"
-                        else "meanCoverage" if options.countMode == "coverage"
-                        else "eventMass"
+                        "signalMean"
+                        if source.sourceKind == "BEDGRAPH"
+                        else (
+                            "meanCoverage"
+                            if options.countMode == "coverage"
+                            else "eventMass"
+                        )
                     )
+
                 self._handles[source.sampleID] = handle
                 self._info[source.sampleID] = info
+            if qualityWarning:
+                warnings.warn(EstimateWarning(), stacklevel=2)
         except BaseException:
             self.close()
             raise
@@ -346,7 +421,7 @@ class Reader:
 
     def _checkOpen(self):
         if self._closed:
-            raise ValueError("Reader is closed")
+            raise SourceError(kind="closed")
 
     @_locked
     def close(self):
@@ -360,18 +435,24 @@ class Reader:
     @_locked
     def sourceInfo(self):
         self._checkOpen()
-        return MappingProxyType({
-            key: MappingProxyType(dict(value)) for key, value in self._info.items()
-        })
+        return MappingProxyType(
+            {key: MappingProxyType(dict(value)) for key, value in self._info.items()}
+        )
 
     @_locked
     def getSourceInfo(self, sampleID, *, inspectLengths=False):
         self._checkOpen()
         if sampleID not in self._info:
-            raise ValueError("Unknown source")
+            raise SourceError(kind="missing")
         info = self._info[sampleID]
-        if inspectLengths and info["sourceKind"] == "BAM" and info["readLength"] is None:
-            options = replace(info["countOptions"], flagExclude=self._readLengthFlags[sampleID])
+        if (
+            inspectLengths
+            and info["sourceKind"] == "BAM"
+            and info["readLength"] is None
+        ):
+            options = replace(
+                info["countOptions"], flagExclude=self._readLengthFlags[sampleID]
+            )
             info["readLength"] = int(self._handles[sampleID].readLength(options))
         return MappingProxyType(dict(info))
 
@@ -379,13 +460,14 @@ class Reader:
     def setReadExtension(self, sampleID, lengthBP):
         self._checkOpen()
         if sampleID not in self._info or self._info[sampleID]["sourceKind"] != "BAM":
-            raise ValueError("Read extension requires a BAM source")
+            raise SourceError()
         info = self._info[sampleID]
         if info["countOptions"].bamInputMode == "fragments":
-            raise ValueError("Template spans do not accept read extension")
+            raise InputError()
         length = checkedInteger(lengthBP, "lengthBP", 1)
         info["countOptions"] = replace(
-            info["countOptions"], extendFrom5pBP=length, inferFragmentLength=False)
+            info["countOptions"], extendFrom5pBP=length, inferFragmentLength=False
+        )
         info["fragmentLengthBP"] = length
         info["fragmentLengthDiagnostics"] = None
         info["chromosomeRanges"].clear()
@@ -395,25 +477,224 @@ class Reader:
     def estimateFragmentLength(self, sampleID):
         self._checkOpen()
         if sampleID not in self._info or self._info[sampleID]["sourceKind"] != "BAM":
-            raise ValueError("Fragment-length estimation requires a BAM source")
+            raise SourceError()
         info = self._info[sampleID]
         if info["fragmentLengthBP"] is None:
             diagnostics = self._handles[sampleID].estimateFragmentLength(
-                info["countOptions"], self.fragmentLengthOptions)
+                info["countOptions"], self.fragmentLengthOptions
+            )
             value = int(diagnostics["estimateBP"])
             info["fragmentLengthDiagnostics"] = diagnostics
             if diagnostics["warnings"]:
-                warnings.warn(". ".join(diagnostics["warnings"]), RuntimeWarning, stacklevel=2)
+                warnings.warn(EstimateWarning(), stacklevel=2)
             if value <= 0:
-                raise ValueError("Fragment-length estimation failed")
+                raise EstimateError()
             info["fragmentLengthBP"] = value
         return info["fragmentLengthBP"]
+
+    @_locked
+    def estimateLengthScale(
+        self,
+        *,
+        sampleIDs=None,
+        options=None,
+        regions=None,
+        excludeRanges=None,
+        bedGraphCounts=False,
+    ):
+        r"""Estimate a length scale for enriched regions (based on MUSIC).
+
+        * Detect enriched regions according to a local vs. background heuristic
+          at multiple filter widths.
+        * For each enriched bin, record the largest filter width under which
+          it qualified as enriched.
+        * Return the average of these maximal filter widths.
+
+        Bootstrap confidence intervals are included with the returned estimate
+        for uncertainty quantification. The intervals may be conditional on
+        detected enrichment and may understate the full variability.
+
+        References
+        ----------
+        Harmanci, Rozowsky and Gerstein (2014), MUSIC.
+        https://doi.org/10.1186/s13059-014-0474-3
+        """
+        self._checkOpen()
+        started = perf_counter()
+        options = LengthScaleOptions() if options is None else options
+        if type(bedGraphCounts) is not bool:
+            raise InputError()
+        selected = selectedSamples(sampleIDs, self.sampleIDs)
+
+        binSize = (
+            self.grid.binSizeBP if options.binSizeBP is None else options.binSizeBP
+        )
+        grid = GridSpec(self.grid.chromosomeSizes, binSize)
+        width = options.blockWidthBP
+        if width % binSize:
+            raise InputError(kind="region")
+
+        exclusions = {}
+        for chromosome, intervals in (
+            {} if excludeRanges is None else excludeRanges
+        ).items():
+            if chromosome not in grid.chromosomeSizes:
+                raise SourceError(kind="missing", context=chromosome)
+            checked = []
+            for start, end in intervals:
+                start = checkedInteger(start, "exclusion startBP")
+                end = checkedInteger(
+                    end, "exclusion endBP", 1, grid.chromosomeSizes[chromosome]
+                )
+                if start >= end or (checked and start < checked[-1][1]):
+                    raise InputError(kind="region")
+                checked.append((start, end))
+            exclusions[chromosome] = checked
+
+        explicit = regions is not None
+        candidateRegions = (
+            list(regions)
+            if explicit
+            else [
+                (chromosome, start, start + width)
+                for chromosome, length in grid.chromosomeSizes.items()
+                for start in range(0, length - width + 1, width)
+            ]
+        )
+        eligible = []
+        excluded = 0
+        for chromosome, start, end in candidateRegions:
+            start, end = grid.checkRegion(chromosome, start, end)
+            if end - start != width or end % binSize:
+                raise InputError(kind="region")
+            overlap = any(
+                start < stop and end > begin
+                for begin, stop in exclusions.get(chromosome, ())
+            )
+            if overlap:
+                if explicit:
+                    raise InputError(kind="region")
+                excluded += 1
+                continue
+            eligible.append((chromosome, start, end))
+        if not eligible:
+            raise EstimateError(kind="insufficient")
+
+        chosen = (
+            eligible
+            if explicit
+            else [
+                eligible[int(i)]
+                for i in sorted(
+                    np.random.default_rng(options.randomSeed).choice(
+                        len(eligible),
+                        min(options.blockCount, len(eligible)),
+                        replace=False,
+                    )
+                )
+            ]
+        )
+
+        sourceInfo = {}
+        countOptions = {}
+        for sampleID in selected:
+            info = self._info[sampleID]
+            kind = info["sourceKind"]
+            if any(
+                chromosome not in info["chromosomeNames"] for chromosome, _, _ in chosen
+            ):
+                raise SourceError(kind="missing", context=sampleID)
+            if kind == "H5AD" and binSize != self.grid.binSizeBP:
+                raise InputError(kind="grid")
+            if kind == "BEDGRAPH" and not bedGraphCounts:
+                raise InputError()
+
+            resolved = info["countOptions"]
+            if kind in ("BAM", "FRAGMENTS"):
+                resolved = replace(resolved, countMode="center")
+            countOptions[sampleID] = resolved
+            source = self.sources[self.sampleIDs.index(sampleID)]
+            unit = (
+                "storedBinCount"
+                if kind == "H5AD"
+                else (
+                    "declaredBinCount"
+                    if kind == "BEDGRAPH"
+                    else (
+                        "fragmentCenter"
+                        if kind == "FRAGMENTS" or resolved.bamInputMode == "fragments"
+                        else "readCenter"
+                    )
+                )
+            )
+
+            sourceInfo[sampleID] = {
+                "path": info["path"],
+                "sourceKind": kind,
+                "eventUnit": unit,
+                "countOptions": None if resolved is None else asdict(resolved),
+                "selection": (
+                    {
+                        k: str(v) if isinstance(v, Path) else v
+                        for k, v in source.selection.items()
+                    }
+                    if isinstance(source.selection, Mapping)
+                    else None if source.selection is None else sorted(source.selection)
+                ),
+                "selectedCellCount": info["selectedCellCount"],
+                "matrixRows": source.matrixRows,
+                "barcodeTag": source.barcodeTag,
+                "fragmentLengthBP": info["fragmentLengthBP"],
+                "inferenceUsed": info["inferenceUsed"],
+                "inferenceStatus": info["inferenceStatus"],
+            }
+
+        def blocks():
+            for chromosome, start, end in chosen:
+                values = np.empty((len(selected), width // binSize), dtype=np.float64)
+                for row, sampleID in enumerate(selected):
+                    handle = self._handles[sampleID]
+                    if self._info[sampleID]["sourceKind"] == "H5AD":
+                        values[row] = handle.count(chromosome, start, end)
+                    else:
+                        values[row] = handle.countRegion(
+                            chromosome,
+                            start,
+                            end,
+                            binSize,
+                            countOptions[sampleID],
+                            False,
+                        )[0]
+                yield values
+
+        sampling = {
+            "explicitRegions": explicit,
+            "eligibleBlockCount": len(eligible),
+            "selectedBlockCount": len(chosen),
+            "excludedBlockCount": excluded,
+            "terminalBP": sum(
+                length % width for length in grid.chromosomeSizes.values()
+            ),
+            "excludeRanges": exclusions,
+        }
+        result = _estimateLengthScale(
+            blocks(),
+            len(chosen),
+            binSize,
+            selected,
+            options,
+            chosen,
+            sourceInfo,
+            sampling,
+        )
+        result["runtimeSeconds"] = perf_counter() - started
+        return result
 
     @_locked
     def sourceRange(self, sampleID, chromosome, *, flagExclude):
         self._checkOpen()
         if sampleID not in self._info or chromosome not in self.grid.chromosomeSizes:
-            raise ValueError("Unknown source or chromosome")
+            raise SourceError(kind="missing")
         flags = checkedInteger(flagExclude, "flagExclude", 0, 65535)
         key = (sampleID, chromosome, flags)
         if key not in self._sourceRanges:
@@ -434,44 +715,46 @@ class Reader:
     def chromRange(self, sampleID, chromosome):
         self._checkOpen()
         if sampleID not in self._info or chromosome not in self.grid.chromosomeSizes:
-            raise ValueError("Unknown source or chromosome")
+            raise SourceError(kind="missing")
         info = self._info[sampleID]
         if chromosome not in info["chromosomeRanges"]:
             if info["sourceKind"] == "H5AD":
                 result = (0, self.grid.chromosomeSizes[chromosome])
             else:
-                result = tuple(self._handles[sampleID].chromRange(
-                    chromosome, info["countOptions"]))
+                result = tuple(
+                    self._handles[sampleID].chromRange(chromosome, info["countOptions"])
+                )
             info["chromosomeRanges"][chromosome] = result
         return info["chromosomeRanges"][chromosome]
 
     @_locked
-    def readRegion(self, chromosome, startBP, endBP, *, sampleIDs=None,
-                   returnRawNoiseMass=False, out=None):
+    def readRegion(
+        self,
+        chromosome,
+        startBP,
+        endBP,
+        *,
+        sampleIDs=None,
+        returnRawNoiseMass=False,
+        out=None,
+    ):
         self._checkOpen()
         start, end = self.grid.checkRegion(chromosome, startBP, endBP)
         if type(returnRawNoiseMass) is not bool:
-            raise ValueError("returnRawNoiseMass must be boolean")
-        selected = self.sampleIDs if sampleIDs is None else tuple(sampleIDs)
-        if not selected or len(set(selected)) != len(selected) or any(
-            sampleID not in self._info for sampleID in selected
-        ):
-            raise ValueError("sampleIDs must select unique reader sources")
+            raise InputError()
+        selected = selectedSamples(sampleIDs, self.sampleIDs)
+
         count = (end - start + self.grid.binSizeBP - 1) // self.grid.binSizeBP
         shape = (len(selected), count)
         if out is None:
             values = np.empty(shape, dtype=self.dtype)
         else:
-            if (
-                not isinstance(out, np.ndarray) or out.shape != shape
-                or out.dtype != self.dtype or not out.flags.c_contiguous
-                or not out.flags.writeable
-            ):
-                raise ValueError("out must match reader shape, dtype, and layout")
-            values = out
+            values = checkOutputArray(out, shape, self.dtype)
+
         noise = np.full(shape, np.nan, dtype=self.dtype) if returnRawNoiseMass else None
         units, modes, available = [], [], []
         limit = np.finfo(self.dtype).max
+
         for row, sampleID in enumerate(selected):
             info = self._info[sampleID]
             handle = self._handles[sampleID]
@@ -481,78 +764,128 @@ class Reader:
                 rawNoise = None
             else:
                 raw, rawNoise = handle.countRegion(
-                    chromosome, start, end, self.grid.binSizeBP,
-                    info["countOptions"], hasNoise,
+                    chromosome,
+                    start,
+                    end,
+                    self.grid.binSizeBP,
+                    info["countOptions"],
+                    hasNoise,
                 )
+
             maximum = float(np.max(raw, initial=0.0))
-            minimum = float(np.min(raw, initial=0.0)) if info["sourceKind"] == "BEDGRAPH" else 0.0
+            minimum = (
+                float(np.min(raw, initial=0.0))
+                if info["sourceKind"] == "BEDGRAPH"
+                else 0.0
+            )
             if not np.isfinite(maximum) or maximum > limit or minimum < -limit:
-                raise ValueError("Raw values exceed reader dtype")
+                raise NumericalError()
             values[row] = raw
             if hasNoise:
                 if rawNoise is None:
-                    raise ValueError("Missing squared-weight output")
+                    raise NativeError()
                 maximumNoise = float(np.max(rawNoise, initial=0.0))
                 if not np.isfinite(maximumNoise) or maximumNoise > limit:
-                    raise ValueError("Squared-weight values exceed reader dtype")
+                    raise NumericalError()
                 noise[row] = rawNoise
             units.append(info["unit"])
             modes.append(info["countMode"])
             available.append(hasNoise)
-        return CountBlock(values, selected, self.grid, chromosome, start, end,
-                          tuple(units), tuple(modes), noise, tuple(available))
 
-    def iterBlocks(self, chromosomes, *, blockSizeBins=500_000, sampleIDs=None,
-                   returnRawNoiseMass=False):
+        return CountBlock(
+            values,
+            selected,
+            self.grid,
+            chromosome,
+            start,
+            end,
+            tuple(units),
+            tuple(modes),
+            noise,
+            tuple(available),
+        )
+
+    def iterBlocks(
+        self,
+        chromosomes,
+        *,
+        blockSizeBins=500_000,
+        sampleIDs=None,
+        returnRawNoiseMass=False,
+    ):
         self._checkOpen()
         count = checkedInteger(blockSizeBins, "blockSizeBins", 1)
         step = count * self.grid.binSizeBP
+
         for chromosome in chromosomes:
             if chromosome not in self.grid.chromosomeSizes:
-                raise ValueError(f"Unknown chromosome {chromosome}")
+                raise SourceError(kind="missing", context=chromosome)
             end = self.grid.chromosomeSizes[chromosome]
             for start in range(0, end, step):
                 yield self.readRegion(
-                    chromosome, start, min(start + step, end),
-                    sampleIDs=sampleIDs, returnRawNoiseMass=returnRawNoiseMass)
+                    chromosome,
+                    start,
+                    min(start + step, end),
+                    sampleIDs=sampleIDs,
+                    returnRawNoiseMass=returnRawNoiseMass,
+                )
 
     @_locked
     def libraryTotals(self, *, chromosomes):
         self._checkOpen()
-        selected = tuple(sorted(chromosomes))
-        if not selected or len(set(selected)) != len(selected) or any(
-            chromosome not in self.grid.chromosomeSizes for chromosome in selected
-        ):
-            raise ValueError("Normalization chromosomes must be unique grid chromosomes")
+        selected = selectedSamples(sorted(chromosomes), self.grid.chromosomeSizes)
         if selected in self._totals:
             return self._totals[selected]
+
         records = {}
         for source in self.sources:
             sampleID = source.sampleID
             info = self._info[sampleID]
             handle = self._handles[sampleID]
             record = {
-                "path": source.path, "barcodeTag": source.barcodeTag,
-                "sourceKind": source.sourceKind, "unit": info["unit"],
-                "countMode": info["countMode"], "eventMass": 0.0, "spanBP": 0.0,
-                "denominatorUnit": "storedBinCount" if source.sourceKind == "H5AD" else "emittedEvent",
-                "requestedMethod": "exact", "usedMethod": "exact",
-                "countOptions": info["countOptions"], "chromosomes": selected,
+                "path": source.path,
+                "barcodeTag": source.barcodeTag,
+                "sourceKind": source.sourceKind,
+                "unit": info["unit"],
+                "countMode": info["countMode"],
+                "eventMass": 0.0,
+                "spanBP": 0.0,
+                "denominatorUnit": (
+                    "storedBinCount" if source.sourceKind == "H5AD" else "emittedEvent"
+                ),
+                "requestedMethod": "exact",
+                "usedMethod": "exact",
+                "countOptions": info["countOptions"],
+                "chromosomes": selected,
                 "selectedCellCount": info["selectedCellCount"],
                 "inferenceRequested": info["inferenceRequested"],
                 "inferenceUsed": info["inferenceUsed"],
                 "inferenceStatus": info["inferenceStatus"],
                 "selectedBarcodes": (
                     tuple(sorted(info["selectedBarcodes"]))
-                    if source.selection is not None and info["selectedBarcodes"] is not None else None),
+                    if source.selection is not None
+                    and info["selectedBarcodes"] is not None
+                    else None
+                ),
                 "selection": (
-                    {key: tuple(value) if isinstance(value, (tuple, frozenset)) else
-                     str(value) if isinstance(value, Path) else value
-                     for key, value in source.selection.items()}
-                    if isinstance(source.selection, Mapping) else
-                    tuple(sorted(source.selection)) if source.selection is not None else None),
+                    {
+                        key: (
+                            tuple(value)
+                            if isinstance(value, (tuple, frozenset))
+                            else str(value) if isinstance(value, Path) else value
+                        )
+                        for key, value in source.selection.items()
+                    }
+                    if isinstance(source.selection, Mapping)
+                    else (
+                        tuple(sorted(source.selection))
+                        if source.selection is not None
+                        else None
+                    )
+                ),
                 "metadata": {"chromosomes": {}},
             }
+
             if info["selectedCellCount"] == 0:
                 record["metadata"]["selectedCellCount"] = 0
             elif source.sourceKind == "BEDGRAPH":
@@ -565,15 +898,28 @@ class Reader:
             else:
                 for chromosome in selected:
                     evidence = handle.totalsRegion(
-                        chromosome, 0, self.grid.chromosomeSizes[chromosome], info["countOptions"])
+                        chromosome,
+                        0,
+                        self.grid.chromosomeSizes[chromosome],
+                        info["countOptions"],
+                    )
                     record["eventMass"] += evidence["eventMass"]
                     record["spanBP"] += evidence["spanBP"]
                     record["metadata"]["chromosomes"][chromosome] = evidence
             records[sampleID] = record
+
         result = LibraryTotals(records, self.grid, selected)
         self._totals[selected] = result
         return result
 
 
-def openSources(sources, grid, *, threads=1, dtype="float32", fragmentLengthOptions=None):
-    return Reader(sources, grid, threads=threads, dtype=dtype, fragmentLengthOptions=fragmentLengthOptions)
+def openSources(
+    sources, grid, *, threads=1, dtype="float32", fragmentLengthOptions=None
+):
+    return Reader(
+        sources,
+        grid,
+        threads=threads,
+        dtype=dtype,
+        fragmentLengthOptions=fragmentLengthOptions,
+    )

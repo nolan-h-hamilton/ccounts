@@ -1,5 +1,17 @@
 # cython: language_level=3, boundscheck=False, wraparound=False, initializedcheck=False, cdivision=True
 import numpy as np
+from .exceptions import (
+    AllocationError,
+    CountError,
+    EstimateError,
+    EstimateWarning,
+    InputError,
+    NativeError,
+    NumericalError,
+    OperationError,
+    OutputExistsError,
+    SourceError,
+)
 from pathlib import Path
 from time import perf_counter
 cimport numpy as cnp
@@ -8,10 +20,38 @@ from libc.math cimport log, log1p, fabs, fmax, isfinite
 from libc.stdlib cimport free
 from libc.string cimport memcpy
 
+# numeric codes passed to countsBackend
+cdef enum:
+    sourceBAM = 0
+    sourceFragments = 1
+    sourceBedGraph = 2
+
+    modeCoverage = 0
+    modeConservedFractionalOverlap = 1
+    modeCenter = 2
+    modeFivePrime = 3
+    modeFFP = 4
+    modeBinOverlap = 5
+
+    inputReads = 0
+    inputFragments = 1
+    inputRead1 = 2
+
+cdef enum:
+    pairedInspectSampleSize = 1000
+    defaultMaxTemplateLengthBP = 1000
+
+# log2(x) = log(x) * log2E
+cdef const double log2E = 1.4426950408889634074
+cdef const double log1pRatioLimit = 0.5
+cdef const double safeDifferenceMagnitude = 8.988465674311578e307
+cdef const double minNormalDouble = 2.2250738585072014e-308
+
 cnp.import_array()
 
 include "fragmentLength.pxi"
 include "pairedFragmentLength.pxi"
+include "lengthScale.pxi"
 
 cdef extern from "native/countsBackend.h":
     ctypedef struct ccSource:
@@ -40,7 +80,7 @@ cdef extern from "native/countsBackend.h":
                 const ccOptions *, double *, double *, size_t, const char **) nogil
     int ccRegionTotals(ccSource *, const char *, int64_t, int64_t, int64_t,
                        const ccOptions *, ccTotals *, const char **) nogil
-    int ccInspect(ccSource *, const ccOptions *, int, int *, double *, const char **) nogil
+    int ccInspect(ccSource *, const ccOptions *, int, int *, const char **) nogil
     int ccReadLength(ccSource *, uint16_t, uint32_t *, const char **) nogil
     int ccSourceRange(ccSource *, const char *, uint64_t, uint16_t, uint64_t *, uint64_t *, const char **) nogil
     int ccChromRange(ccSource *, const char *, int64_t, const ccOptions *, int64_t *, int64_t *, const char **) nogil
@@ -61,26 +101,26 @@ cdef extern from "native/countsBackend.h":
     int ccBuildIndex(const char *, int, const char *, int, const char **) nogil
 
 cdef int _kind(str kind) except -1:
-    if kind == "BAM": return 0
-    if kind == "FRAGMENTS": return 1
-    if kind == "BEDGRAPH": return 2
-    raise ValueError("unsupported native source kind")
+    if kind == "BAM": return sourceBAM
+    if kind == "FRAGMENTS": return sourceFragments
+    if kind == "BEDGRAPH": return sourceBedGraph
+    raise SourceError()
 
 cdef ccOptions _options(object options) except *:
     cdef ccOptions out
     cdef str mode = options.countMode
     cdef str bamMode = options.bamInputMode
-    if mode == "coverage": out.countMode = 0
-    elif mode == "conservedFractionalOverlap": out.countMode = 1
-    elif mode == "center": out.countMode = 2
-    elif mode == "fiveprime": out.countMode = 3
-    elif mode == "ffp": out.countMode = 4
-    elif mode == "binOverlap": out.countMode = 5
-    else: raise ValueError("unsupported native count mode")
-    if bamMode in ("reads", "auto"): out.bamInputMode = 0
-    elif bamMode == "fragments": out.bamInputMode = 1
-    elif bamMode == "read1": out.bamInputMode = 2
-    else: raise ValueError("unsupported BAM input mode")
+    if mode == "coverage": out.countMode = modeCoverage
+    elif mode == "conservedFractionalOverlap": out.countMode = modeConservedFractionalOverlap
+    elif mode == "center": out.countMode = modeCenter
+    elif mode == "fiveprime": out.countMode = modeFivePrime
+    elif mode == "ffp": out.countMode = modeFFP
+    elif mode == "binOverlap": out.countMode = modeBinOverlap
+    else: raise InputError(kind="option", context="countMode")
+    if bamMode in ("reads", "auto"): out.bamInputMode = inputReads
+    elif bamMode == "fragments": out.bamInputMode = inputFragments
+    elif bamMode == "read1": out.bamInputMode = inputRead1
+    else: raise InputError(kind="option", context="bamInputMode")
     out.flagExclude = options.flagExclude
     out.minMappingQuality = options.minMappingQuality
     out.minTemplateLengthBP = options.minTemplateLengthBP
@@ -94,8 +134,8 @@ cdef ccOptions _options(object options) except *:
 cdef void _raise(int status, const char *error) except *:
     if status != 0:
         if error != NULL:
-            raise ValueError((<bytes>error).decode("utf-8"))
-        raise RuntimeError("native source operation failed")
+            raise NativeError((<bytes>error).decode("utf-8"))
+        raise OperationError()
 
 cdef class NativeSource:
     cdef ccSource *_source
@@ -124,7 +164,7 @@ cdef class NativeSource:
         cdef const char *error = NULL
         cdef const char *name
         cdef int64_t length
-        if threadCount < 1: raise ValueError("threads must be positive")
+        if threadCount < 1: raise InputError(kind="integer", context="threads")
         self.path = str(path)
         self._barcodeAllowListFile = str(barcodeAllowListFile)
         self._barcodeTag = str(barcodeTag)
@@ -146,7 +186,7 @@ cdef class NativeSource:
                 self.chromosomeSizes[chromosome] = int(length)
                 if chromosome in self._sizes and self._sizes[chromosome] != length:
                     self.close()
-                    raise ValueError(f"BAM chromosome size conflicts with grid: {chromosome}")
+                    raise InputError(kind="grid")
         self.chromosomeNames = tuple(names)
 
     def __dealloc__(self):
@@ -155,7 +195,7 @@ cdef class NativeSource:
             self._source = NULL
 
     cdef void _checkOpen(self) except *:
-        if self._source == NULL: raise ValueError("native source is closed")
+        if self._source == NULL: raise SourceError(kind="closed")
 
     def close(self):
         if self._source != NULL:
@@ -177,7 +217,7 @@ cdef class NativeSource:
         self._checkOpen()
         length = self._sizes[chromosome]
         if start < 0 or end <= start or end > length or binSizeBP <= 0 or start % binSizeBP or (end != length and end % binSizeBP):
-            raise ValueError("region must follow the chromosome grid")
+            raise InputError(kind="region")
         count = (end - start + binSizeBP - 1) // binSizeBP
         values = np.zeros(count, dtype=np.float64)
         if returnRawNoiseMass:
@@ -199,7 +239,7 @@ cdef class NativeSource:
         cdef const char *error = NULL
         self._checkOpen()
         length = self._sizes[chromosome]
-        if start < 0 or end <= start or end > length: raise ValueError("invalid totals ownership range")
+        if start < 0 or end <= start or end > length: raise InputError(kind="region")
         with nogil:
             status = ccRegionTotals(self._source, namePointer, length, start, end, &parsed, &totals, &error)
         _raise(status, error)
@@ -208,11 +248,10 @@ cdef class NativeSource:
     def pairedEnd(self, options):
         cdef ccOptions parsed = _options(options)
         cdef int paired, status
-        cdef double length
         cdef const char *error = NULL
         self._checkOpen()
         with nogil:
-            status = ccInspect(self._source, &parsed, 1000, &paired, &length, &error)
+            status = ccInspect(self._source, &parsed, pairedInspectSampleSize, &paired, &error)
         _raise(status, error)
         return bool(paired)
 
@@ -267,7 +306,7 @@ cdef class NativeSource:
         cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] forwardArray, reverseArray
         self._checkOpen()
         if chromosome not in self.chromosomeSizes or start < 0 or end <= start or end > self.chromosomeSizes[chromosome]:
-            raise ValueError("Invalid endpoint block")
+            raise InputError(kind="region")
         with nogil:
             status = ccBlockEndpoints(self._source, namePointer, start, end, &parsed,
                                        &forward, &reverse, &nF, &nR, &counts, &error)
@@ -299,18 +338,18 @@ cdef class NativeSource:
     def estimateFragmentLength(self, options, fragmentLengthOptions):
         self._checkOpen()
         if self.sourceKind != "BAM":
-            raise ValueError("Fragment-length estimation requires a BAM source")
+            raise SourceError()
         if self.pairedEnd(options):
             started = perf_counter()
             result = _pairedFragmentLength(
                 self.path, self._threads, options.flagExclude,
-                1000 if options.maxTemplateLengthBP is None else options.maxTemplateLengthBP,
+                defaultMaxTemplateLengthBP if options.maxTemplateLengthBP is None else options.maxTemplateLengthBP,
                 self._barcodeAllowListFile, self._barcodeTag)
             result.update({"method": "pairedTemplateMedian", "CILowerBP": None,
                            "CIUpperBP": None, "bootstrapStdBP": None, "warnings": [],
                            "runtimeSeconds": perf_counter() - started})
             if result["status"] == "insufficientData":
-                result["warnings"].append("Insufficient retained paired templates for a median, using 147 bp")
+                result["warnings"].append(EstimateWarning.variants["fewFragments"])
             return result
         from .fragmentLength import _estimateSingleEnd
         return _estimateSingleEnd(self, options, fragmentLengthOptions)
@@ -331,17 +370,17 @@ def indexSource(path, sourceKind, *, targetPath=None, threads=1):
     cdef int threadCount = threads
     cdef int status
     cdef const char *error = NULL
-    if threadCount < 1: raise ValueError("threads must be positive")
-    if kind == 2 and (targetPath is None or str(targetPath) == str(path)):
-        raise ValueError("bedGraph indexing requires a separate targetPath")
-    if kind == 2 and Path(targetPath).exists():
-        raise FileExistsError("bedGraph index target already exists")
+    if threadCount < 1: raise InputError(kind="integer", context="threads")
+    if kind == sourceBedGraph and (targetPath is None or str(targetPath) == str(path)):
+        raise InputError(kind="option", context="targetPath")
+    if kind == sourceBedGraph and Path(targetPath).exists():
+        raise OutputExistsError()
     targetBytes = b"" if targetPath is None else str(targetPath).encode("utf-8")
     targetPointer = targetBytes
     with nogil:
         status = ccBuildIndex(pathPointer, kind, targetPointer, threadCount, &error)
     _raise(status, error)
-    return str(path) if kind != 2 else str(targetPath)
+    return str(path) if kind != sourceBedGraph else str(targetPath)
 
 ctypedef fused real_t:
     cnp.float32_t
@@ -352,11 +391,11 @@ cdef inline double _logSum(double x, double p) noexcept nogil:
     if x > 0:
         high = fmax(x, p)
         low = x if p > x else p
-        return (log(high) + log1p(low / high)) * 1.4426950408889634074
+        return (log(high) + log1p(low / high)) * log2E
     total = p + x
     removed = total - p
     residual = (p - (total - removed)) + (x - removed)
-    return (log(total) + log1p(residual / total)) * 1.4426950408889634074
+    return (log(total) + log1p(residual / total)) * log2E
 
 cdef void _logLoop(const real_t *values, const real_t *reference, real_t *out,
                     Py_ssize_t count, double pseudocount) noexcept nogil:
@@ -371,64 +410,71 @@ cdef void _logLoop(const real_t *values, const real_t *reference, real_t *out,
             scale = fmax(fmax(fabs(x), fabs(r)), pseudocount)
             scaledR = (r + pseudocount) / scale if r < 0 else r / scale + pseudocount / scale
             delta = x / scale - r / scale
-            if scaledR > 0 and fabs(delta) <= 0.5 * scaledR:
-                if (x >= 0 and r >= 0) or (x <= 0 and r <= 0) or (fabs(x) <= 8.988465674311578e307 and fabs(r) <= 8.988465674311578e307):
+            if scaledR > 0 and fabs(delta) <= log1pRatioLimit * scaledR:
+                if (x >= 0 and r >= 0) or (x <= 0 and r <= 0) or (fabs(x) <= safeDifferenceMagnitude and fabs(r) <= safeDifferenceMagnitude):
                     delta = (x - r) / scale
                 ratio = delta / scaledR
-                out[i] = <real_t>(log1p(ratio) * 1.4426950408889634074)
+                out[i] = <real_t>(log1p(ratio) * log2E)
             else:
                 scaledX = (x + pseudocount) / scale if x < 0 else x / scale + pseudocount / scale
-                if scaledX >= 2.2250738585072014e-308 and scaledR >= 2.2250738585072014e-308:
-                    out[i] = <real_t>(log(scaledX / scaledR) * 1.4426950408889634074)
+                if scaledX >= minNormalDouble and scaledR >= minNormalDouble:
+                    out[i] = <real_t>(log(scaledX / scaledR) * log2E)
                 else:
                     out[i] = <real_t>(_logSum(x, pseudocount) - _logSum(r, pseudocount))
+
+
+cdef inline Py_ssize_t _checkLogValues(object values, object reference,
+    double pseudocount, object out) except -1:
+    cdef Py_ssize_t count
+    cdef size_t byteCount
+    cdef uintptr_t valuesAddress, outAddress, referenceAddress
+    if (
+        not isinstance(values, np.ndarray) or values.ndim not in (1, 2)
+        or values.dtype not in (np.dtype("float32"), np.dtype("float64"))
+        or not values.flags.c_contiguous
+    ):
+        raise InputError(kind="array")
+    if (
+        not isinstance(out, np.ndarray) or out.shape != values.shape
+        or out.dtype != values.dtype or not out.flags.c_contiguous
+        or not out.flags.writeable
+    ):
+        raise InputError(kind="output")
+    if not isfinite(pseudocount) or pseudocount <= 0:
+        raise NumericalError(kind="logDomain")
+    if reference is not None and (
+        not isinstance(reference, np.ndarray) or reference.shape != values.shape
+        or reference.dtype != values.dtype or not reference.flags.c_contiguous
+    ):
+        raise InputError(kind="array")
+    count = (<cnp.ndarray>values).size
+    byteCount = count * (sizeof(cnp.float32_t) if values.dtype == np.float32 else sizeof(cnp.float64_t))
+    valuesAddress = <uintptr_t>(<cnp.ndarray>values).data
+    outAddress = <uintptr_t>(<cnp.ndarray>out).data
+    if byteCount and valuesAddress != outAddress and (
+        valuesAddress < outAddress + byteCount and outAddress < valuesAddress + byteCount
+    ):
+        raise InputError(kind="overlap")
+    if reference is not None:
+        referenceAddress = <uintptr_t>(<cnp.ndarray>reference).data
+        if byteCount and referenceAddress != outAddress and (
+            referenceAddress < outAddress + byteCount and outAddress < referenceAddress + byteCount
+        ):
+            raise InputError(kind="overlap")
+    return count
 
 
 def logValues(values, reference, double pseudocount, out):
     cdef cnp.ndarray valuesArray
     cdef cnp.ndarray outArray
     cdef cnp.ndarray referenceArray
-    cdef Py_ssize_t count
-    cdef size_t byteCount
-    cdef uintptr_t valuesAddress, outAddress, referenceAddress
+    cdef Py_ssize_t count = _checkLogValues(values, reference, pseudocount, out)
     cdef const cnp.float32_t *reference32 = NULL
     cdef const cnp.float64_t *reference64 = NULL
-    if (
-        not isinstance(values, np.ndarray) or values.ndim not in (1, 2)
-        or values.dtype not in (np.dtype("float32"), np.dtype("float64"))
-        or not values.flags.c_contiguous
-    ):
-        raise ValueError("values must be a C-contiguous 1D/2D float32 or float64 array")
-    if (
-        not isinstance(out, np.ndarray) or out.shape != values.shape
-        or out.dtype != values.dtype or not out.flags.c_contiguous
-        or not out.flags.writeable
-    ):
-        raise ValueError("out must match values shape/dtype and be writable C-contiguous storage")
-    if not isfinite(pseudocount) or pseudocount <= 0:
-        raise ValueError("pseudocount must be finite and positive")
-    if reference is not None and (
-        not isinstance(reference, np.ndarray) or reference.shape != values.shape
-        or reference.dtype != values.dtype or not reference.flags.c_contiguous
-    ):
-        raise ValueError("reference must match values shape, dtype, and C layout")
     valuesArray = values
     outArray = out
-    count = valuesArray.size
-    byteCount = count * (4 if values.dtype == np.float32 else 8)
-    valuesAddress = <uintptr_t>valuesArray.data
-    outAddress = <uintptr_t>outArray.data
-    if byteCount and valuesAddress != outAddress and (
-        valuesAddress < outAddress + byteCount and outAddress < valuesAddress + byteCount
-    ):
-        raise ValueError("Partial input/output overlap is unsupported")
     if reference is not None:
         referenceArray = reference
-        referenceAddress = <uintptr_t>referenceArray.data
-        if byteCount and referenceAddress != outAddress and (
-            referenceAddress < outAddress + byteCount and outAddress < referenceAddress + byteCount
-        ):
-            raise ValueError("Partial reference/output overlap is unsupported")
         if values.dtype == np.float32: reference32 = <const cnp.float32_t *>referenceArray.data
         else: reference64 = <const cnp.float64_t *>referenceArray.data
     if values.dtype == np.float32:

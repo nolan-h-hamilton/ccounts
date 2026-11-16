@@ -1,19 +1,23 @@
+/* Barcode selection struct and helpers */
 #ifndef CONSENRICH_BARCODE_SELECTION_H
 #define CONSENRICH_BARCODE_SELECTION_H
 
+#include "native/messages.h"
 #include <htslib/sam.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+/** @brief Barcode tag and allow-list for one source. */
 typedef struct crBarcodeSelection
 {
-    char tag[3];
-    char **barcodes;
-    size_t count;
-    int active;
+    char tag[3];     ///< two-char BAM tag plus NUL
+    char **barcodes; ///< sorted barcode allow-list
+    size_t count;    ///< number of barcodes
+    int active;      ///< 0 = keep all, 1 = filter (empty list keeps none)
 } crBarcodeSelection;
+
 
 static int crBarcodeCompare(const void *left, const void *right)
 {
@@ -43,7 +47,7 @@ static crBarcodeSelection *crBarcodeSelectionCreate(
     char **expanded;
     if (selection == NULL)
     {
-        *error = "failed to allocate barcode selection";
+        *error = ccAllocationFailed;
         return NULL;
     }
     if (path == NULL || path[0] == '\0')
@@ -54,7 +58,7 @@ static crBarcodeSelection *crBarcodeSelectionCreate(
         !((tag[1] >= 'A' && tag[1] <= 'Z') || (tag[1] >= 'a' && tag[1] <= 'z') ||
           (tag[1] >= '0' && tag[1] <= '9')))
     {
-        *error = "barcodeTag must be a two-character SAM tag";
+        *error = ccInvalidBarcodeTag;
         crBarcodeSelectionDestroy(selection);
         return NULL;
     }
@@ -62,7 +66,7 @@ static crBarcodeSelection *crBarcodeSelectionCreate(
     fileHandle = fopen(path, "r");
     if (fileHandle == NULL)
     {
-        *error = "failed to open barcode allowlist";
+        *error = ccInputOpenFailed;
         crBarcodeSelectionDestroy(selection);
         return NULL;
     }
@@ -89,7 +93,7 @@ static crBarcodeSelection *crBarcodeSelectionCreate(
     if (!feof(fileHandle))
     {
         fclose(fileHandle);
-        *error = "failed to read barcode allowlist";
+        *error = ccInputReadFailed;
         crBarcodeSelectionDestroy(selection);
         return NULL;
     }
@@ -115,6 +119,7 @@ static int crBarcodeSelected(const crBarcodeSelection *selection, const bam1_t *
     barcode = (char *)(value + 1);
     if (barcode[0] == '\0')
         return 0;
+    // return whether barcode is in selection
     return bsearch(&barcode, selection->barcodes, selection->count,
                    sizeof(char *), crBarcodeCompare) != NULL;
 }

@@ -42,7 +42,7 @@ jobs:
       - name: Install package and test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --only-binary=:all: ".[test,h5ad]"
+          python -m pip install --only-binary=:all: ".[test]"
 
       - name: Test installed package
         working-directory: ${{ runner.temp }}

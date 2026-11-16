@@ -49,7 +49,7 @@ int ccRegionTotals(ccSource *source, const char *chromosome, int64_t chromosomeL
                    int64_t start, int64_t end, const ccOptions *options,
                    ccTotals *totals, const char **error);
 int ccInspect(ccSource *source, const ccOptions *options, int maxRecords,
-              int *paired, double *readLength, const char **error);
+              int *paired, const char **error);
 int ccReadLength(ccSource *source, uint16_t flagExclude, uint32_t *readLength,
                  const char **error);
 int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength,

@@ -70,22 +70,22 @@ cdef dict _pairedFragmentLength(
         maxInsertSize = 1
     fileHandle = sam_open(bamBytes, "r")
     if fileHandle == NULL:
-        raise ValueError("Could not open BAM for paired fragment lengths")
+        raise SourceError(kind="io")
     try:
         selection = crBarcodeSelectionCreate(tagBytes, allowBytes, &selectionError)
         if selection == NULL:
-            raise ValueError((<bytes>selectionError).decode("utf-8"))
+            raise NativeError((<bytes>selectionError).decode("utf-8"))
         if samThreads > 1 and hts_set_threads(<htsFile *>fileHandle, samThreads) < 0:
-            raise ValueError("Could not configure BAM reader threads")
+            raise SourceError(kind="io")
         header = sam_hdr_read(fileHandle)
         if header == NULL or header.n_targets <= 0:
-            raise ValueError("Paired fragment lengths require a BAM sequence dictionary")
+            raise SourceError()
         indexHandle = sam_index_load(<htsFile *>fileHandle, bamBytes)
         if indexHandle == NULL:
-            raise ValueError("Paired fragment lengths require an indexed BAM")
+            raise SourceError(kind="index")
         record = bam_init1()
         if record == NULL:
-            raise MemoryError("Could not allocate BAM record")
+            raise AllocationError()
         lengths = np.empty(header.n_targets, dtype=np.int64)
         for contigIndex in range(header.n_targets):
             lengths[contigIndex] = header.target_len[contigIndex]
@@ -99,12 +99,12 @@ cdef dict _pairedFragmentLength(
                 continue
             iteratorHandle = sam_itr_queryi(indexHandle, contigTid, 0, contigLen)
             if iteratorHandle == NULL:
-                raise ValueError("Could not query BAM for paired read lengths")
+                raise SourceError(kind="io")
             while True:
                 status = sam_itr_next(<htsFile *>fileHandle, iteratorHandle, record)
                 if status < 0:
                     if status < -1:
-                        raise ValueError("Could not read BAM for paired read lengths")
+                        raise SourceError(kind="io")
                     break
                 readFlag = record.core.flag
                 if readFlag & samFlagExclude:
@@ -113,7 +113,7 @@ cdef dict _pairedFragmentLength(
                     continue
                 selected = crBarcodeSelected(selection, record)
                 if selected < 0:
-                    raise ValueError("barcodeTag requires SAM type Z")
+                    raise InputError(kind="selection")
                 if not selected:
                     continue
                 if readLengthCount >= 1000:
@@ -131,7 +131,7 @@ cdef dict _pairedFragmentLength(
                 break
         if readLengthCount == 0:
             if hasSelection:
-                raise ValueError("could not estimate fragment length from selected BAM records")
+                raise EstimateError()
             return {"estimateBP": 147, "status": "insufficientData", "retainedTemplateCount": 0,
                     "minimumTemplateLengthBP": None, "maximumTemplateLengthBP": int(maxInsertSize)}
         minimum = <int64_t>(readLengthSum / readLengthCount)
@@ -146,12 +146,12 @@ cdef dict _pairedFragmentLength(
                 continue
             iteratorHandle = sam_itr_queryi(indexHandle, contigTid, 0, contigLen)
             if iteratorHandle == NULL:
-                raise ValueError("Could not query BAM for paired fragment lengths")
+                raise SourceError(kind="io")
             while True:
                 status = sam_itr_next(<htsFile *>fileHandle, iteratorHandle, record)
                 if status < 0:
                     if status < -1:
-                        raise ValueError("Could not read BAM for paired fragment lengths")
+                        raise SourceError(kind="io")
                     break
                 if tlenN >= 2000:
                     break
@@ -160,12 +160,12 @@ cdef dict _pairedFragmentLength(
                     continue
                 selected = crBarcodeSelected(selection, record)
                 if selected < 0:
-                    raise ValueError("barcodeTag requires SAM type Z")
+                    raise InputError(kind="selection")
                 if not selected or not readFlag & 2:
                     continue
                 tlen = record.core.isize
                 if tlen == -9223372036854775807 - 1:
-                    raise ValueError("Template length exceeds signed native range")
+                    raise NumericalError()
                 if tlen < 0:
                     tlen = -tlen
                 if tlen == 0 or tlen < minimum or tlen > maxInsertSize:
@@ -176,7 +176,7 @@ cdef dict _pairedFragmentLength(
             iteratorHandle = NULL
         if tlenN < (1 if hasSelection else 500):
             if hasSelection:
-                raise ValueError("could not estimate fragment length from selected BAM records")
+                raise EstimateError()
             return {"estimateBP": 147, "status": "insufficientData", "retainedTemplateCount": tlenN,
                     "minimumTemplateLengthBP": int(minimum), "maximumTemplateLengthBP": int(maxInsertSize)}
         estimate = np.partition(templateLengths[:tlenN], tlenN // 2)[tlenN // 2]

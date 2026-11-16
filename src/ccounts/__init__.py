@@ -1,15 +1,73 @@
-from .sources import countModes, sourceKinds, CountOptions, GridSpec, SourceSpec, readChromSizes, prepareIndex, selectionGroups
+from .sources import (
+    countModes,
+    sourceKinds,
+    CountOptions,
+    GridSpec,
+    SourceSpec,
+    readChromSizes,
+    prepareIndex,
+    selectionGroups,
+)
 from .fragmentLength import FragmentLengthOptions
+from .lengthScale import LengthScaleOptions, estimateLengthScaleCounts
 from .counting import CountBlock, Reader, openSources
 from .normalization import LibraryTotals, Normalization, estimateSizeFactors
 from .transforms import logTransform
-from .genomes import standardChromosomes, assemblyChromosomeSizes, assemblyBlacklistRanges
+from .exceptions import (
+    InputError,
+    SelectionError,
+    CountError,
+    SourceError,
+    EstimateError,
+    NumericalError,
+    NativeError,
+    OperationError,
+    DependencyError,
+    OutputExistsError,
+    AllocationError,
+    EstimateWarning,
+)
+from .genomes import (
+    standardChromosomes,
+    assemblyChromosomeSizes,
+    assemblyBlacklistRanges,
+)
 
-__version__ = "0.1.0a0"
+__version__ = "0.2.0b0"
 
 __all__ = [
-    "FragmentLengthOptions", "countModes", "sourceKinds", "CountOptions", "GridSpec", "SourceSpec", "CountBlock", "Reader",
-    "LibraryTotals", "Normalization", "estimateSizeFactors", "openSources", "readChromSizes",
-    "prepareIndex", "selectionGroups", "logTransform", "standardChromosomes",
-    "assemblyChromosomeSizes", "assemblyBlacklistRanges", "__version__",
+    "InputError",
+    "SelectionError",
+    "CountError",
+    "SourceError",
+    "EstimateError",
+    "NumericalError",
+    "NativeError",
+    "OperationError",
+    "DependencyError",
+    "OutputExistsError",
+    "AllocationError",
+    "EstimateWarning",
+    "LengthScaleOptions",
+    "estimateLengthScaleCounts",
+    "FragmentLengthOptions",
+    "countModes",
+    "sourceKinds",
+    "CountOptions",
+    "GridSpec",
+    "SourceSpec",
+    "CountBlock",
+    "Reader",
+    "LibraryTotals",
+    "Normalization",
+    "estimateSizeFactors",
+    "openSources",
+    "readChromSizes",
+    "prepareIndex",
+    "selectionGroups",
+    "logTransform",
+    "standardChromosomes",
+    "assemblyChromosomeSizes",
+    "assemblyBlacklistRanges",
+    "__version__",
 ]

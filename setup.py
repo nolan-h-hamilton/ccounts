@@ -20,12 +20,29 @@ class BuildNative(build_ext):
         if buildDir.exists():
             shutil.rmtree(buildDir)
         buildDir.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(vendorDir, buildDir, ignore=shutil.ignore_patterns("*.o", "*.a", ".git", ".DS_Store", "config.h", "config.mk", "config_vars.h", "htscodecs.mk"))
+        shutil.copytree(
+            vendorDir,
+            buildDir,
+            ignore=shutil.ignore_patterns(
+                "*.o",
+                "*.a",
+                ".git",
+                ".DS_Store",
+                "config.h",
+                "config.mk",
+                "config_vars.h",
+                "htscodecs.mk",
+            ),
+        )
+
         cflags = "-O3 -fvisibility=hidden -fPIC"
         if sys.platform == "darwin":
-            target = os.environ.get("MACOSX_DEPLOYMENT_TARGET") or sysconfig.get_config_var("MACOSX_DEPLOYMENT_TARGET")
+            target = os.environ.get(
+                "MACOSX_DEPLOYMENT_TARGET"
+            ) or sysconfig.get_config_var("MACOSX_DEPLOYMENT_TARGET")
             if target:
                 cflags += f" -mmacosx-version-min={target}"
+
         (buildDir / "config.mk").write_text(
             f"CC = {os.environ.get('CC', 'cc')}\n"
             f"RANLIB = {os.environ.get('RANLIB', 'ranlib')}\n"
@@ -49,6 +66,7 @@ class BuildNative(build_ext):
             '#define HTS_LDFLAGS ""\n'
             '#define HTS_LIBS ""\n'
         )
+
         subprocess.run(["make", "-C", str(buildDir), "-j2", "lib-static"], check=True)
         for extension in self.extensions:
             extension.include_dirs.extend([str(buildDir), str(buildDir / "htslib")])
@@ -58,10 +76,17 @@ class BuildNative(build_ext):
 
 extension = Extension(
     "ccounts._native",
-    sources=["src/ccounts/_native.pyx", "src/ccounts/native/countsBackend.c"],
+    sources=[
+        "src/ccounts/_native.pyx",
+        "src/ccounts/native/countsBackend.c",
+        "src/ccounts/native/fenwickMedian.c",
+    ],
     include_dirs=[numpy.get_include(), "src/ccounts"],
     libraries=["z"] + (["m", "pthread"] if sys.platform.startswith("linux") else []),
     extra_objects=[],
     extra_compile_args=["-O3", "-fno-trapping-math", "-fno-math-errno"],
 )
-setup(ext_modules=cythonize([extension], build_dir="build/cython", language_level="3"), cmdclass={"build_ext": BuildNative})
+setup(
+    ext_modules=cythonize([extension], build_dir="build/cython", language_level="3"),
+    cmdclass={"build_ext": BuildNative},
+)
