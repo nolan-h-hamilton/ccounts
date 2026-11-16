@@ -18,6 +18,14 @@ test = ["pytest", "pysam>=0.23.3"]
 package-dir = {"" = "src"}
 include-package-data = false
 
+[tool.setuptools.package-data]
+ccounts = [
+    "data/gaps/*.bed.gz",
+    "data/gaps/*.json",
+    "mappability/*.npz",
+    "mappability/*.json",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["ccounts", "ccounts.*"]
@@ -35,7 +43,7 @@ force-exclude = "/(vendor|build)/"
 build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
 test-extras = ["test"]
 test-command = [
-    'python -I -c "import ccounts._native, anndata, h5py, pysam, scipy"',
+    'python -I -c "import ccounts._native, ccounts._mappability, anndata, h5py, pysam, scipy"',
     'python -I -m pytest -q --import-mode=importlib {project}/tests',
 ]
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -29,7 +30,11 @@ from .exceptions import (
 )
 from .normalization import LibraryTotals
 from .fragmentLength import FragmentLengthOptions
-from .lengthScale import LengthScaleOptions, _estimateLengthScale
+from .lengthScale import (
+    LengthScaleOptions,
+    _estimateLengthScale,
+    _lengthScaleExclusions,
+)
 
 
 def _locked(method):
@@ -534,22 +539,9 @@ class Reader:
         if width % binSize:
             raise InputError(kind="region")
 
-        exclusions = {}
-        for chromosome, intervals in (
-            {} if excludeRanges is None else excludeRanges
-        ).items():
-            if chromosome not in grid.chromosomeSizes:
-                raise SourceError(kind="missing", context=chromosome)
-            checked = []
-            for start, end in intervals:
-                start = checkedInteger(start, "exclusion startBP")
-                end = checkedInteger(
-                    end, "exclusion endBP", 1, grid.chromosomeSizes[chromosome]
-                )
-                if start >= end or (checked and start < checked[-1][1]):
-                    raise InputError(kind="region")
-                checked.append((start, end))
-            exclusions[chromosome] = checked
+        assembly, exclusions = _lengthScaleExclusions(
+            grid.chromosomeSizes, excludeRanges
+        )
 
         explicit = regions is not None
         candidateRegions = (
@@ -567,10 +559,9 @@ class Reader:
             start, end = grid.checkRegion(chromosome, start, end)
             if end - start != width or end % binSize:
                 raise InputError(kind="region")
-            overlap = any(
-                start < stop and end > begin
-                for begin, stop in exclusions.get(chromosome, ())
-            )
+            intervals = exclusions.get(chromosome, ())
+            position = bisect_left(intervals, (end,))
+            overlap = position > 0 and intervals[position - 1][1] > start
             if overlap:
                 if explicit:
                     raise InputError(kind="region")
@@ -675,6 +666,7 @@ class Reader:
             "terminalBP": sum(
                 length % width for length in grid.chromosomeSizes.values()
             ),
+            "exclusionAssembly": assembly,
             "excludeRanges": exclusions,
         }
         result = _estimateLengthScale(

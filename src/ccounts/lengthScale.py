@@ -1,4 +1,6 @@
 from dataclasses import asdict, dataclass
+import gzip
+from importlib.resources import files
 import json
 import logging
 from time import perf_counter
@@ -6,7 +8,8 @@ from time import perf_counter
 import numpy as np
 
 from .checks import checkedInteger, checkedReal, checkCountValues
-from .exceptions import CountError, DependencyError, InputError
+from .exceptions import CountError, DependencyError, InputError, SourceError
+from .genomes import assemblyBlacklistRanges, assemblyChromosomeSizes
 
 
 @dataclass(frozen=True)
@@ -47,19 +50,20 @@ class LengthScaleOptions:
     """
 
     binSizeBP: int | None = None
-    blockCount: int = 64
-    blockWidthBP: int = 1000000
+    blockCount: int = 128
+    blockWidthBP: int = 500000
     scaleStartBP: int | None = None
-    scaleEndBP: int = 2500000
+    scaleEndBP: int = 125_000
     scaleFactor: float = 1.5
     smoothingRatio: float = 4.0
     significanceLevel: float = 0.05
     pValueWindowBP: int = 1500
-    backgroundWindowBP: int = 1000000
+    backgroundWindowBP: int | None = None
     bootstrapReplicates: int = 1000
     confidenceLevel: float = 0.95
     randomSeed: int = 42
     returnProfiles: bool = False
+    filterType: str = "median"
 
     def __post_init__(self):
         # check fields after construction
@@ -68,9 +72,17 @@ class LengthScaleOptions:
             "blockWidthBP",
             "scaleEndBP",
             "pValueWindowBP",
-            "backgroundWindowBP",
         ):
             object.__setattr__(self, name, checkedInteger(getattr(self, name), name, 1))
+        object.__setattr__(
+            self,
+            "backgroundWindowBP",
+            (
+                min(5_000_000, max(50_000, self.blockWidthBP // 10))
+                if self.backgroundWindowBP is None
+                else checkedInteger(self.backgroundWindowBP, "backgroundWindowBP", 1)
+            ),
+        )
         for name in ("binSizeBP", "scaleStartBP"):
             if getattr(self, name) is not None:
                 object.__setattr__(
@@ -106,6 +118,66 @@ class LengthScaleOptions:
             raise InputError(kind="grid")
         if type(self.returnProfiles) is not bool:
             raise InputError(kind="option", context="returnProfiles")
+        if type(self.filterType) is not str or self.filterType not in (
+            "median",
+            "mean",
+        ):
+            raise InputError(kind="option", context="filterType")
+
+
+def _lengthScaleExclusions(chromosomeSizes, excludeRanges):
+    matches = [
+        assembly
+        for assembly, sizes in assemblyChromosomeSizes.items()
+        if all(
+            sizes.get(chromosome) == length
+            for chromosome, length in chromosomeSizes.items()
+        )
+    ]
+    assembly = matches[0] if len(matches) == 1 else None
+    if assembly is None and excludeRanges is None:
+        raise InputError(kind="grid", context="assembly")
+
+    exclusions = {}
+    if assembly is not None:
+        blacklist = assemblyBlacklistRanges.get(assembly, {})
+        exclusions = {
+            chromosome: list(blacklist.get(chromosome, ()))
+            for chromosome in chromosomeSizes
+        }
+        resource = files("ccounts") / "data" / "gaps" / f"{assembly}.bed.gz"
+        with resource.open("rb") as raw, gzip.open(raw, "rt") as handle:
+            for line in handle:
+                chromosome, start, end = line.split()
+                if chromosome in chromosomeSizes:
+                    exclusions[chromosome].append((int(start), int(end)))
+
+    if excludeRanges is not None:
+        for chromosome, intervals in excludeRanges.items():
+            if chromosome not in chromosomeSizes:
+                raise SourceError(kind="missing", context=chromosome)
+            checked = []
+            for start, end in intervals:
+                start = checkedInteger(start, "exclusion startBP")
+                end = checkedInteger(
+                    end, "exclusion endBP", 1, chromosomeSizes[chromosome]
+                )
+                if start >= end or (checked and start < checked[-1][1]):
+                    raise InputError(kind="region")
+                checked.append((start, end))
+            exclusions.setdefault(chromosome, []).extend(checked)
+
+    merged = {}
+    for chromosome, intervals in exclusions.items():
+        combined = []
+        for start, end in sorted(intervals):
+            if combined and start <= combined[-1][1]:
+                combined[-1] = (combined[-1][0], max(combined[-1][1], end))
+            else:
+                combined.append((start, end))
+        if combined:
+            merged[chromosome] = combined
+    return assembly, merged
 
 
 def _lengthScaleRequest(blockCount, binSizeBP, sampleIDs, options, regions):
@@ -157,6 +229,64 @@ def _lengthScaleCountBlock(block, sampleCount, binCount):
     if np.any(raw.sum(axis=1, dtype=np.float64) > 2**52):
         raise CountError()
     return np.ascontiguousarray(raw, dtype=np.int64)
+
+
+def correctMappabilityCounts(counts, donorBins, binSizeBP, *, windowBP=2000):
+    r"""Raise low counts using nearby bins with reliable read mapping.
+
+    Impute from nearby donor bins to account for mappability artifacts / sparsity.
+    Adapted directly from MUSIC.
+
+    References
+    ----------
+    Harmanci, Rozowsky and Gerstein (2014), MUSIC.
+    https://doi.org/10.1186/s13059-014-0474-3
+    """
+    values = np.asarray(counts)
+    donors = np.asarray(donorBins)
+    if (
+        values.ndim != 3
+        or min(values.shape) < 1
+        or donors.shape != values.shape
+        or donors.dtype != np.dtype(bool)
+    ):
+        raise InputError(kind="array")
+    binSizeBP = checkedInteger(binSizeBP, "binSizeBP", 1)
+    windowBP = checkedInteger(windowBP, "windowBP", 1)
+    checkCountValues(values)
+    if np.any(values.sum(axis=2, dtype=np.float64) > 2**52):
+        raise CountError()
+
+    result = values.copy() if values.dtype.kind in "iu" else values.astype(np.int64)
+    radius = min(windowBP // (2 * binSizeBP), values.shape[2] - 1)
+    sentinel = np.iinfo(np.int64).max
+    positions = np.arange(values.shape[2])
+    for block in range(values.shape[0]):
+        for sample in range(values.shape[1]):
+            signal = np.asarray(values[block, sample], dtype=np.int64)
+            eligible = donors[block, sample]
+            if radius == len(signal) - 1:
+                selected = signal[eligible]
+                if len(selected):
+                    median = np.partition(selected, len(selected) // 2)[
+                        len(selected) // 2
+                    ]
+                    result[block, sample] = np.maximum(signal, median)
+                continue
+            padded = np.pad(
+                np.where(eligible, signal, sentinel),
+                radius,
+                constant_values=sentinel,
+            )
+            windows = np.lib.stride_tricks.sliding_window_view(padded, 2 * radius + 1)
+            donorCounts = np.count_nonzero(windows != sentinel, axis=1)
+            ordered = np.sort(windows, axis=1)
+            medians = ordered[positions, donorCounts // 2]
+            supported = donorCounts > 0
+            result[block, sample, supported] = np.maximum(
+                signal[supported], medians[supported]
+            )
+    return result
 
 
 def _histogramQuantiles(histograms, widths, probabilities):
@@ -242,7 +372,7 @@ def _intervalFields(point, draws, blockCount, options, widths):
     return result
 
 
-def _blockSupport(signal, windows, binSizeBP, options, functions):
+def _blockSupport(signal, windows, binSizeBP, options, functions, smoothingSignal=None):
     medianProfile, nativeLogTail, findPeaks, poisson, binomial = functions
     nBins = len(signal)
     largest = np.zeros(nBins, dtype=np.intp)
@@ -251,9 +381,13 @@ def _blockSupport(signal, windows, binSizeBP, options, functions):
     if signal.sum() == 0:
         return largest, intervalCounts, coverageCounts
 
-    countValues, indices = np.unique(signal, return_inverse=True)
-    countValues = countValues.astype(float)
-    indices = np.ascontiguousarray(indices, dtype=np.intp)
+    filterSignal = signal if smoothingSignal is None else smoothingSignal
+    if options.filterType == "median":
+        countValues, indices = np.unique(filterSignal, return_inverse=True)
+        countValues = countValues.astype(float)
+        indices = np.ascontiguousarray(indices, dtype=np.intp)
+    else:
+        positions = np.arange(nBins)
 
     means = np.empty(nBins)
     backgroundBins = max(1, round(options.backgroundWindowBP / binSizeBP))
@@ -263,6 +397,12 @@ def _blockSupport(signal, windows, binSizeBP, options, functions):
 
     thresholds = poisson.ppf(1 - options.significanceLevel, means)
     countsOPrefix = np.r_[np.int64(0), np.cumsum(signal)]
+    if options.filterType == "mean":
+        smoothingPrefix = (
+            countsOPrefix
+            if smoothingSignal is None
+            else np.r_[np.int64(0), np.cumsum(smoothingSignal)]
+        )
     backgroundPrefix = np.r_[0.0, np.cumsum(means)]
     cache = {}
 
@@ -278,13 +418,20 @@ def _blockSupport(signal, windows, binSizeBP, options, functions):
         return result
 
     for scale, width in enumerate(windows):
-        smooth = medianProfile(indices, countValues, int(width))
+        if options.filterType == "median":
+            smooth = medianProfile(indices, countValues, int(width))
+        else:
+            windowStarts = np.maximum(0, positions - width // 2)
+            windowEnds = np.minimum(nBins, positions + width // 2 + 1)
+            smooth = (smoothingPrefix[windowEnds] - smoothingPrefix[windowStarts]) / (
+                windowEnds - windowStarts
+            )
         minima, _ = findPeaks(-smooth, plateau_size=True)
         boundaries = np.unique(np.r_[0, minima, nBins - 1])
         covered = np.zeros(nBins + 1, dtype=np.int64)
         for left, last in zip(boundaries[:-1], boundaries[1:], strict=True):
             left, right = int(left), int(last) + 1
-            rawMaximum = signal[
+            rawMaximum = filterSignal[
                 max(0, left - width // 2) : min(nBins, right + width // 2)
             ].max()
             smoothMaximum = smooth[left:right].max()
@@ -362,6 +509,7 @@ def _estimateLengthScale(
     regions=None,
     sourceInfo=None,
     sampling=None,
+    smoothingCounts=None,
 ):
     started = perf_counter()
     try:
@@ -379,9 +527,16 @@ def _estimateLengthScale(
     )
     nSamples = len(sampleIDs)
     nBins = options.blockWidthBP // binSizeBP
+    if smoothingCounts is not None:
+        smoothingCounts = np.asarray(smoothingCounts)
+        if smoothingCounts.shape != (blockCount, nSamples, nBins):
+            raise InputError(kind="array")
 
-    scaleStart = binSizeBP if options.scaleStartBP is None else options.scaleStartBP
-    maximumWidth = min(options.scaleEndBP, options.blockWidthBP)
+    scaleStart = max(
+        3 * binSizeBP,
+        0 if options.scaleStartBP is None else options.scaleStartBP,
+    )
+    maximumWidth = min(125_000, options.scaleEndBP, options.blockWidthBP)
     if scaleStart > maximumWidth:
         raise InputError()
     nominalCount = (
@@ -392,11 +547,12 @@ def _estimateLengthScale(
         raise InputError(kind="grid")
     nominal = scaleStart * options.scaleFactor ** np.arange(nominalCount)
     # Round to odd bin counts for the filter
-    windows = np.unique(np.maximum(1, np.rint(nominal / binSizeBP).astype(np.intp)) | 1)
-    windows = windows[windows <= nBins]
+    windows = np.unique(np.rint(nominal / binSizeBP).astype(np.intp) | 1)
+    widths = windows * binSizeBP
+    retained = (widths >= scaleStart) & (widths <= maximumWidth)
+    windows, widths = windows[retained], widths[retained]
     if not len(windows):
         raise InputError(kind="grid")
-    widths = windows * binSizeBP
 
     settings = dict(
         asdict(options),
@@ -414,6 +570,8 @@ def _estimateLengthScale(
 
     if sampling is not None:
         settings["sampling"] = sampling
+    if smoothingCounts is not None:
+        settings["smoothingCountsProvided"] = True
 
     logging.getLogger("ccounts.lengthScale").info(
         "Length-scale configuration %s",
@@ -439,11 +597,21 @@ def _estimateLengthScale(
         if blockIndex >= blockCount:
             raise InputError(kind="array")
         values = _lengthScaleCountBlock(block, nSamples, nBins)
+        smoothingValues = (
+            None
+            if smoothingCounts is None
+            else _lengthScaleCountBlock(smoothingCounts[blockIndex], nSamples, nBins)
+        )
 
         stamp = perf_counter()
         for sample, signal in enumerate(values):
             largest, intervalCounts, coverageCounts = _blockSupport(
-                signal, windows, binSizeBP, options, functions
+                signal,
+                windows,
+                binSizeBP,
+                options,
+                functions,
+                None if smoothingValues is None else smoothingValues[sample],
             )
             # Store width counts so bootstrap draws don't need full bin arrays.
             histograms[blockIndex, sample] = np.bincount(
@@ -545,7 +713,13 @@ def _estimateLengthScale(
 
 
 def estimateLengthScaleCounts(
-    counts, binSizeBP, *, sampleIDs=None, options=None, regions=None
+    counts,
+    binSizeBP,
+    *,
+    sampleIDs=None,
+    options=None,
+    regions=None,
+    smoothingCounts=None,
 ):
     r"""Estimate length scale from block counts"""
     values = np.asarray(counts)
@@ -558,5 +732,11 @@ def estimateLengthScaleCounts(
         else tuple(sampleIDs)
     )
     return _estimateLengthScale(
-        iter(values), values.shape[0], binSizeBP, sampleIDs, options, regions=regions
+        iter(values),
+        values.shape[0],
+        binSizeBP,
+        sampleIDs,
+        options,
+        regions=regions,
+        smoothingCounts=smoothingCounts,
     )

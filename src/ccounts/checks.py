@@ -4,6 +4,7 @@ import operator
 import numpy as np
 
 from .exceptions import CountError, InputError, SourceError
+from .genomes import assemblyChromosomeSizes
 
 coordinateLimit = 2**31 - 1
 
@@ -65,3 +66,46 @@ def checkOutputArray(out, shape, dtype):
     ):
         raise InputError(kind="output")
     return out
+
+
+def checkedMappabilityReference(assembly, chromosome, referenceSizes):
+    if type(assembly) is not str or assembly not in assemblyChromosomeSizes:
+        raise SourceError(kind="missing", context=str(assembly))
+    sizes = assemblyChromosomeSizes[assembly]
+    if type(chromosome) is not str or chromosome not in sizes:
+        raise SourceError(kind="missing", context=f"{assembly}/{chromosome}")
+    if referenceSizes is not None and dict(referenceSizes) != sizes:
+        raise InputError(kind="grid", context="mappability reference")
+    return sizes
+
+
+def checkedMappabilityEdges(runBytes, chromosomeLength, k):
+    if runBytes.dtype != np.uint8 or runBytes.ndim != 2 or runBytes.shape[0] != 4:
+        raise SourceError(kind="metadata", context="mappability encoding")
+    runLengths = np.ascontiguousarray(runBytes.T).view("<u4").reshape(-1)
+    if (
+        runLengths.size % 2 == 0
+        or (runLengths[1:] == 0).any()
+        or runLengths[-1] < min(chromosomeLength, k - 1)
+    ):
+        raise SourceError(kind="metadata", context="mappability runs")
+    edges = np.r_[np.int64(0), np.cumsum(runLengths, dtype=np.int64)]
+    if edges[-1] != chromosomeLength:
+        raise SourceError(kind="metadata", context="mappability runs")
+    return edges
+
+
+def checkedMappabilityIntervals(starts, ends, chromosomeLength, measure):
+    if type(measure) is not str or measure not in (
+        "multiRead",
+        "meanMultiRead",
+        "singleRead",
+        "uniqueStart",
+    ):
+        raise InputError(kind="option", context="measure")
+    starts, ends = np.broadcast_arrays(np.asarray(starts), np.asarray(ends))
+    if starts.dtype.kind not in "iu" or ends.dtype.kind not in "iu":
+        raise InputError(kind="integer", context="mappability intervals")
+    if (starts < 0).any() or (ends > chromosomeLength).any() or (ends <= starts).any():
+        raise InputError(kind="region", context="mappability intervals")
+    return starts.astype(np.int64, copy=False), ends.astype(np.int64, copy=False)

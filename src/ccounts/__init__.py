@@ -9,7 +9,12 @@ from .sources import (
     selectionGroups,
 )
 from .fragmentLength import FragmentLengthOptions
-from .lengthScale import LengthScaleOptions, estimateLengthScaleCounts
+from .mappabilityScores import Mappability
+from .lengthScale import (
+    LengthScaleOptions,
+    correctMappabilityCounts,
+    estimateLengthScaleCounts,
+)
 from .counting import CountBlock, Reader, openSources
 from .normalization import LibraryTotals, Normalization, estimateSizeFactors
 from .transforms import logTransform
@@ -49,8 +54,10 @@ __all__ = [
     "AllocationError",
     "EstimateWarning",
     "LengthScaleOptions",
+    "correctMappabilityCounts",
     "estimateLengthScaleCounts",
     "FragmentLengthOptions",
+    "Mappability",
     "countModes",
     "sourceKinds",
     "CountOptions",

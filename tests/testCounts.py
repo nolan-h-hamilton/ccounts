@@ -332,7 +332,7 @@ def testLogDomainAndPrecision(dtype):
     )
 
     values = np.ones((2, 3), dtype=dtype)
-    readonly = np.empty_like(values)
+    readonly = np.ones_like(values)
     readonly.flags.writeable = False
     for array, reference, target in (
         (values.astype(np.int32), None, np.empty((2, 3), dtype=np.int32)),
@@ -345,6 +345,26 @@ def testLogDomainAndPrecision(dtype):
     ):
         with pytest.raises(ValueError):
             _native.logValues(array, reference, 1.0, target)
+
+    unaligned = np.ndarray(
+        values.shape, dtype=dtype, buffer=bytearray(values.nbytes + 1), offset=1
+    )
+    swapped = values.astype(values.dtype.newbyteorder("S"))
+    for invalid in (unaligned, swapped):
+        for array, reference, target in (
+            (invalid, None, np.empty_like(values)),
+            (values, invalid, np.empty_like(values)),
+            (values, None, invalid),
+        ):
+            with pytest.raises(cc.InputError):
+                _native.logValues(array, reference, 1.0, target)
+
+    target = np.empty_like(values)
+    assert _native.logValues(readonly, readonly, 1.0, target) is target
+    np.testing.assert_array_equal(target, 0)
+    inPlace = np.full_like(values, 3)
+    assert _native.logValues(inPlace, readonly, 1.0, inPlace) is inPlace
+    np.testing.assert_array_equal(inPlace, 1)
 
 
 def testFloat64SizeFactorsAndCatalogs():
