@@ -56,7 +56,7 @@ class LengthScaleOptions:
     """
 
     binSizeBP: int | None = None
-    blockCount: int = 4096
+    blockCount: int = 1024
     blockWidthBP: int = 500000
 
     scaleStartBP: int | None = None

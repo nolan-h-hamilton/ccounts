@@ -498,7 +498,7 @@ def testReferenceMasksBeforeSampling(countSources, recwarn):
         options.blockCount,
         options.blockWidthBP,
         options.randomSeed,
-    ) == (None, 4096, 500000, 42)
+    ) == (None, 1024, 500000, 42)
 
     sizes = {"chr1": cc.assemblyChromosomeSizes["hg38"]["chr1"]}
     assembly, mask = _lengthScaleExclusions(sizes, None)
