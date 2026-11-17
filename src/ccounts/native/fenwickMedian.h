@@ -17,4 +17,9 @@ int ccMedianProfile(const intptr_t *valueIndices, size_t nBins,
                     const double *values, size_t nValues, size_t windowBins,
                     double *result);
 
+int ccCorrectMappabilityCounts(const int64_t *signal, const uint8_t *donors,
+                               const intptr_t *valueIndices, size_t nBins,
+                               const int64_t *values, size_t nValues,
+                               size_t radius, int64_t *result);
+
 #endif

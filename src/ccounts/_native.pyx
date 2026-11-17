@@ -53,6 +53,7 @@ cnp.import_array()
 include "fragmentLength.pxi"
 include "pairedFragmentLength.pxi"
 include "lengthScale.pxi"
+include "mappabilityCorrection.pxi"
 
 cdef extern from "native/countsBackend.h":
     ctypedef struct ccSource:

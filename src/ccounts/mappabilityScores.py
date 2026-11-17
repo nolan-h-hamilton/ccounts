@@ -19,13 +19,13 @@ class Mappability:
     Bins can have any positive integer width. The map groups consecutive bases
     with the same mappability value into *runs*.
 
-    - ``multiRead`` divides unique overlapping starts by the bin width plus 49.
-    - ``meanMultiRead`` averages the per-base multi-read scores.
-    - ``singleRead`` gives the fraction of bases covered by a unique 50-mer.
-    - ``uniqueStart`` gives the fraction of positions with a unique 50-mer.
+    Mappability can be quantified using different measures:
 
-    Use the same reference DNA and complete contig set as the resource.
-    Passing ``referenceSizes`` checks the contig names and lengths.
+    - ``multiRead`` divides unique overlapping starts by bin size + 49.
+    - ``meanMultiRead`` averages the per-base scores over the bin
+    - ``singleRead`` gives the fraction of nucleotides covered by a unique 50-mer.
+    - ``uniqueStart`` gives the fraction of starts with a unique 50-mer.
+
     """
 
     k = 50

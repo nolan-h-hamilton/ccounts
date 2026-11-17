@@ -59,7 +59,7 @@ def testExceptionMessagesAndSerialization(errorType, builtinType, arguments, mes
 
 
 def testPythonAndCythonExceptions(tmp_path):
-    options = cc.LengthScaleOptions(blockWidthBP=300, bootstrapReplicates=2)
+    options = cc.LengthScaleOptions(blockWidthBP=300)
     with pytest.raises(cc.CountError, match="Counts must be"):
         cc.estimateLengthScaleCounts([[[-1, 0, 0]]], 100, options=options)
     with pytest.raises(cc.CountError, match="Counts must be"):
