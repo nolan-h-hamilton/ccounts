@@ -67,6 +67,11 @@ typedef struct {
 
     ccTotals *totals;           ///< totals output, non-NULL selects totals mode
 
+    const int64_t *endpointRegions;
+    size_t endpointRegionCount;
+    double endpointMass;
+    double endpointCorrection;
+
     int64_t rangeStart;         ///< leftmost retained span start, -1 if none
     int64_t rangeEnd;           ///< rightmost retained span end (exclusive), 0 if none
 } ccWork;
@@ -443,6 +448,25 @@ static void ccSpan(ccWork *work, const ccEvent *event) {
     }
 }
 
+static int ccEndpointInRegions(const ccWork *work, int64_t point) {
+    const int64_t *regions = work->endpointRegions;
+    size_t first = 0, stop = work->endpointRegionCount;
+
+    if (point < work->start || point >= work->end) return 0;
+
+    // Find the first interval whose right boundary exceeds the endpoint.
+    while (first < stop) {
+        size_t middle = first + (stop - first) / 2;
+
+        if (regions[2 * middle + 1] <= point)
+            first = middle + 1;
+        else
+            stop = middle;
+    }
+
+    return first < work->endpointRegionCount && point >= regions[2 * first];
+}
+
 /**
  * @brief Add one accepted read/fragment to totals or bin counts, using its
  * multiplicity and the selected counting mode.
@@ -450,6 +474,19 @@ static void ccSpan(ccWork *work, const ccEvent *event) {
  * through `work`'s rangeStart and rangeEnd fields.
  */
 static void ccConsume(ccWork *work, const ccEvent *event) {
+    if (work->endpointRegions) {
+        int k, matches = 0;
+
+        for (k = 0; k < event->pointCount; ++k)
+            matches += ccEndpointInRegions(work, event->point[k]);
+
+        if (matches)
+            ccAccumulate(event->multiplicity * matches, &work->endpointMass,
+                         &work->endpointCorrection);
+
+        return;
+    }
+
     if (work->totals) {
         work->totals->eventMass += event->multiplicity *
             (work->options->countMode >= 2 && work->options->countMode <= 4 ?
@@ -942,6 +979,39 @@ int ccRegionTotals(ccSource *source, const char *chromosome, int64_t chromosomeL
 
     return ccVisit(
         source, chromosome, chromosomeLength, start, end, options, &work, 1, error);
+}
+
+int ccRegionEndpointTotal(ccSource *source, const char *chromosome,
+                          int64_t chromosomeLength, const int64_t *regions,
+                          size_t regionCount, const ccOptions *options,
+                          double *total, const char **error) {
+    ccWork work = {0};
+    int64_t start, end = 0;
+    size_t i;
+    int status;
+
+    if (source->kind == 2 || options->countMode != 3)
+        return ccFail(error, ccInvalidUnits);
+    if (!regionCount) return ccFail(error, ccInvalidRegion);
+
+    for (i = 0; i < regionCount; ++i) {
+        start = regions[2 * i];
+        if (start < end) return ccFail(error, ccInvalidRegion);
+        end = regions[2 * i + 1];
+        if (end <= start || end > chromosomeLength)
+            return ccFail(error, ccInvalidRegion);
+    }
+
+    work.start = regions[0];
+    work.end = end;
+    work.options = options;
+    work.endpointRegions = regions;
+    work.endpointRegionCount = regionCount;
+
+    status = ccVisit(source, chromosome, chromosomeLength, work.start, work.end,
+                     options, &work, 0, error);
+    *total = work.endpointMass + work.endpointCorrection;
+    return status;
 }
 
 static int ccCompareReadLengths(const void *first, const void *second) {

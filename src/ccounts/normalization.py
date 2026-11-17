@@ -129,21 +129,64 @@ class Normalization:
         )
 
     @classmethod
-    def fromTotals(cls, totals, *, method, effectiveGenomeSizeBP=None):
+    def fromRegions(cls, reader, regionPath, *, sampleIDs=None, scaleTo=10_000.0):
+        scale = checkedReal(scaleTo, "scaleTo")
+        if scale <= 0:
+            raise InputError(kind="scalar", context="scaleTo")
+
+        records = reader._regionEndpointTotals(regionPath, sampleIDs=sampleIDs)
+        return cls(
+            tuple(records),
+            [scale / record["regionEndpointMass"] for record in records.values()],
+            (False,) * len(records),
+            tuple(record["unit"] for record in records.values()),
+            reader.grid,
+            "ReadsInRegions",
+            records,
+        )
+
+    @classmethod
+    def fromTotals(
+        cls,
+        totals,
+        *,
+        method,
+        effectiveGenomeSizeBP=None,
+        effectiveGenomeSizeChromosomes=None,
+    ):
         if method not in ("CPM", "RPKM", "RPGC"):
             raise InputError(kind="option", context="method")
 
         if method == "RPGC":
+            context = "effectiveGenomeSizeChromosomes"
+            if isinstance(effectiveGenomeSizeChromosomes, (str, bytes)):
+                raise InputError(kind="normalization", context=context)
+            try:
+                chromosomes = tuple(effectiveGenomeSizeChromosomes)
+            except TypeError as error:
+                raise InputError(kind="normalization", context=context) from error
+            if not chromosomes or any(
+                not isinstance(name, str) for name in chromosomes
+            ):
+                raise InputError(kind="normalization", context=context)
+            chromosomeSet = set(chromosomes)
+            if len(chromosomeSet) != len(chromosomes) or chromosomeSet != set(
+                totals.chromosomes
+            ):
+                raise InputError(kind="normalization", context=context)
+            if effectiveGenomeSizeBP is None:
+                raise InputError(kind="scalar", context="effectiveGenomeSizeBP")
             if isinstance(effectiveGenomeSizeBP, dict):
                 genomeSizes = effectiveGenomeSizeBP
                 if set(genomeSizes) != set(totals.sampleIDs):
                     raise InputError(kind="normalization")
             else:
                 genomeSizes = dict.fromkeys(totals.sampleIDs, effectiveGenomeSizeBP)
-        else:
-            if effectiveGenomeSizeBP is not None:
-                raise InputError()
-            genomeSizes = {}
+        elif (
+            effectiveGenomeSizeBP is not None
+            or effectiveGenomeSizeChromosomes is not None
+        ):
+            raise InputError()
 
         factors, widths, units = [], [], []
         for sampleID, record in totals.records.items():

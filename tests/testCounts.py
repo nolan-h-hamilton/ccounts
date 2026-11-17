@@ -1,8 +1,10 @@
 from dataclasses import replace
 from pathlib import Path
+import gzip
 import math
 from shutil import copyfile
 from unittest.mock import patch
+import h5py
 import numpy as np
 import pysam
 import pytest
@@ -84,7 +86,14 @@ def testFixtureCountsAndNormalization(countSources, mode, values, mass, dtype):
         }
 
         for method, factor in factors.items():
-            args = {"effectiveGenomeSizeBP": 115} if method == "RPGC" else {}
+            args = (
+                {
+                    "effectiveGenomeSizeBP": 115,
+                    "effectiveGenomeSizeChromosomes": ("chr1",),
+                }
+                if method == "RPGC"
+                else {}
+            )
 
             if factor is None:
                 with pytest.raises(ValueError):
@@ -126,6 +135,104 @@ def testFixtureCountsAndNormalization(countSources, mode, values, mass, dtype):
         expected = distinct.values * np.array([[2], [3]], dtype=dtype)
         assert supplied.apply(distinct, out=distinct.values) is distinct.values
         np.testing.assert_array_equal(distinct.values, expected)
+
+
+@pytest.mark.parametrize("compressed,scaleTo", [(False, None), (True, 35.0)])
+def testNormalizationFromRegions(countSources, tmp_path, compressed, scaleTo):
+    grid = cc.GridSpec.fromSizesFile(countSources["sizes"], binSizeBP=50)
+    sources = [
+        cc.SourceSpec(
+            countSources["eventsBAM"],
+            "BAM",
+            "bam",
+            cc.CountOptions(countMode="coverage", bamInputMode="fragments"),
+            selection=("A",),
+        ),
+        cc.SourceSpec(
+            countSources["events"],
+            "FRAGMENTS",
+            "fragments",
+            cc.CountOptions(countMode="center", fragmentsUseReadSupport=True),
+            selection=("B",),
+        ),
+    ]
+    regions = (
+        "# reference regions\nchr1\t60\t61\tpeak\n\n"
+        "chr1\t34\t45\nchr1\t33\t35\nchr1\t104\t105\n"
+    )
+    if compressed:
+        regionPath = tmp_path / "reference.bed.gz"
+        with gzip.open(regionPath, "wt", encoding="utf-8") as handle:
+            handle.write(regions)
+    else:
+        regionPath = tmp_path / "reference.bed"
+        regionPath.write_text(regions, encoding="utf-8")
+
+    args = {} if scaleTo is None else {"scaleTo": scaleTo}
+    with cc.openSources(sources, grid, dtype="float64") as reader:
+        block = reader.readRegion("chr1", 0, 115)
+        sampleIDs = block.sampleIDs[::-1]
+        norm = cc.Normalization.fromRegions(
+            reader, regionPath, sampleIDs=sampleIDs, **args
+        )
+
+        # BAM contributes at 34 and 104. The selected fragment contributes at 60.
+        expected = (10_000.0 if scaleTo is None else scaleTo) / np.array([7.0, 5.0])
+        assert norm.method == "ReadsInRegions"
+        assert norm.sampleIDs == sampleIDs
+        np.testing.assert_array_equal(norm.sourceFactors, expected)
+        np.testing.assert_allclose(
+            norm.apply(block), block.values[::-1] * expected[:, None]
+        )
+
+        empty = tmp_path / "noInsertions.bed"
+        empty.write_text("chr1\t61\t62\n", encoding="utf-8")
+        with pytest.raises(cc.EstimateError, match="No endpoints.*bam"):
+            cc.Normalization.fromRegions(reader, empty)
+
+
+def testRPGCTerritory():
+    grid = cc.GridSpec({"chr1": 100, "chr2": 200, "chr3": 300})
+    record = {
+        "unit": "meanCoverage",
+        "sourceKind": "BAM",
+        "countMode": "coverage",
+        "eventMass": 10,
+        "spanBP": 100,
+    }
+    totals = cc.LibraryTotals({"a": record, "b": record}, grid, ("chr1", "chr2"))
+    norm = cc.Normalization.fromTotals(
+        totals,
+        method="RPGC",
+        effectiveGenomeSizeBP={"b": 200, "a": 300},
+        effectiveGenomeSizeChromosomes=("chr2", "chr1"),
+    )
+    np.testing.assert_array_equal(norm.sourceFactors, [3, 2])
+
+    for chromosomes in (
+        None,
+        ("chr1",),
+        ("chr1", "chr3"),
+        ("chr1", "chr2", "chr2"),
+        tuple(grid.chromosomeSizes),
+    ):
+        with pytest.raises(cc.InputError, match="effectiveGenomeSizeChromosomes"):
+            cc.Normalization.fromTotals(
+                totals,
+                method="RPGC",
+                effectiveGenomeSizeBP=600,
+                effectiveGenomeSizeChromosomes=chromosomes,
+            )
+
+    with pytest.raises(cc.InputError, match="effectiveGenomeSizeBP"):
+        cc.Normalization.fromTotals(
+            totals, method="RPGC", effectiveGenomeSizeChromosomes=totals.chromosomes
+        )
+
+    with pytest.raises(cc.InputError):
+        cc.Normalization.fromTotals(
+            totals, method="CPM", effectiveGenomeSizeChromosomes=totals.chromosomes
+        )
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
@@ -424,11 +531,15 @@ def testFixtureIndexesAndSelection(countSources, tmp_path):
 
 
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
-def testH5ADSelectionAndTotals(tmp_path, storage):
+def testH5ADSelectionAndTotals(storage):
     path = Path(__file__).parent / "data" / f"counts-{storage}.h5ad"
     allow = Path(__file__).parent / "data" / "allow.txt"
+    grid = cc.GridSpec({"chr1": 115, "chr2": 115})
 
-    for barcodes, expected in ((("A", "B"), [[3, 1, 2]]), (("B",), [[0, 0, 0]])):
+    for barcodes, cellCount, expected in (
+        (("A", "B"), 1, [3, 1, 2]),
+        (("B",), 0, [0, 0, 0]),
+    ):
         selection = {
             "barcodeColumn": "cellID",
             "groupColumn": "group",
@@ -439,15 +550,99 @@ def testH5ADSelectionAndTotals(tmp_path, storage):
 
         with cc.openSources(
             [cc.SourceSpec(path, "H5AD", "s", selection=selection)],
-            cc.GridSpec({"chr1": 115}),
+            grid,
         ) as reader:
             block = reader.readRegion("chr1", 0, 115, returnRawNoiseMass=True)
 
-            np.testing.assert_array_equal(block.values, expected)
+            np.testing.assert_array_equal(block.values, [expected])
             assert block.noiseAvailable == (False,)
-            assert reader.libraryTotals(chromosomes=["chr1"]).records["s"][
-                "eventMass"
-            ] == sum(expected[0])
+            info = reader.sourceInfo["s"]
+            assert info["selectedCellCount"] == cellCount
+            assert info["chromosomeNames"] == ("chr1",)
+            assert info["chromosomeSizes"] == {"chr1": 115}
+            assert reader.grid.chromosomeSizes == {"chr1": 115, "chr2": 115}
+
+            for query, kwargs in (
+                (reader.sourceRange, {"flagExclude": 3844}),
+                (reader.chromRange, {}),
+            ):
+                assert query("s", "chr1", **kwargs) == (0, 115)
+                with pytest.raises(
+                    cc.SourceError, match="Unknown source or chromosome"
+                ):
+                    query("s", "chr2", **kwargs)
+
+            totals = reader.libraryTotals(chromosomes=["chr1"])
+            assert totals.records["s"]["eventMass"] == sum(expected)
+            with pytest.raises(cc.SourceError, match="Unknown source or chromosome"):
+                reader.libraryTotals(chromosomes=["chr2"])
+
+
+def testCommonFeatureTerritoryAndSelectedTotals(countSources, tmp_path):
+    chr1Path = Path(__file__).parent / "data" / "counts-dense.h5ad"
+    chr2Path = tmp_path / "chr2.h5ad"
+    copyfile(chr1Path, chr2Path)
+    with h5py.File(chr2Path, "r+") as handle:
+        handle["var/chrom/categories"][0] = "chr2"
+        handle["X"][1] = 0
+
+    sources = [
+        cc.SourceSpec(chr1Path, "H5AD", "chr1Matrix"),
+        cc.SourceSpec(chr2Path, "H5AD", "chr2Matrix"),
+        cc.SourceSpec(
+            chr2Path,
+            "H5AD",
+            "zeroMatrix",
+            selection={"barcodeColumn": "cellID", "barcodes": ("B",)},
+        ),
+        cc.SourceSpec(countSources["eventsBAM"], "BAM", "bam"),
+        cc.SourceSpec(countSources["events"], "FRAGMENTS", "fragments"),
+    ]
+    chromosomes = ("chr2", "chr1")
+    sampleIDs = ("fragments", "chr2Matrix", "zeroMatrix")
+    with cc.openSources(sources, cc.GridSpec({"chr1": 115, "chr2": 115})) as reader:
+        assert reader.commonFeatureTerritory(chromosomes=chromosomes) == {
+            "requestedChromosomes": ("chr1", "chr2"),
+            "usedChromosomes": (),
+            "missingChromosomesBySource": {
+                "chr1Matrix": ("chr2",),
+                "chr2Matrix": ("chr1",),
+                "zeroMatrix": ("chr1",),
+                "bam": ("chr2",),
+                "fragments": (),
+            },
+        }
+        territory = reader.commonFeatureTerritory(
+            chromosomes=chromosomes, sampleIDs=sampleIDs
+        )
+        assert territory == {
+            "requestedChromosomes": ("chr1", "chr2"),
+            "usedChromosomes": ("chr2",),
+            "missingChromosomesBySource": {
+                "fragments": (),
+                "chr2Matrix": ("chr1",),
+                "zeroMatrix": ("chr1",),
+            },
+        }
+
+        with pytest.raises(cc.SourceError, match="Unknown source or chromosome"):
+            reader.libraryTotals(chromosomes=chromosomes, sampleIDs=sampleIDs)
+
+        used = territory["usedChromosomes"]
+        totals = reader.libraryTotals(chromosomes=used, sampleIDs=sampleIDs)
+        assert totals.chromosomes == used
+        assert totals.sampleIDs == sampleIDs
+        assert totals.records["fragments"]["eventMass"] == 0
+        assert totals.records["chr2Matrix"]["eventMass"] == 6
+        assert totals.records["zeroMatrix"]["selectedCellCount"] == 1
+        assert totals.records["zeroMatrix"]["eventMass"] == 0
+        assert reader.chromRange("zeroMatrix", "chr2") == (0, 115)
+        assert reader.libraryTotals(chromosomes=used, sampleIDs=sampleIDs) is totals
+        reversedIDs = sampleIDs[::-1]
+        reversedTotals = reader.libraryTotals(chromosomes=used, sampleIDs=reversedIDs)
+        assert reversedTotals.sampleIDs == reversedIDs
+        with pytest.raises(cc.SourceError, match="Unknown source or chromosome"):
+            reader.libraryTotals(chromosomes=used)
 
 
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])

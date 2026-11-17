@@ -9,6 +9,7 @@ from collections.abc import Mapping
 from functools import wraps
 from threading import RLock
 from time import perf_counter
+import gzip
 import warnings
 
 import numpy as np
@@ -278,8 +279,9 @@ class Reader:
         self.sources = tuple(sources)
         if not self.sources:
             raise SourceError()
-        self.sampleIDs = tuple(source.sampleID for source in self.sources)
-        if len(set(self.sampleIDs)) != len(self.sampleIDs):
+        self._sourcesByID = {source.sampleID: source for source in self.sources}
+        self.sampleIDs = tuple(self._sourcesByID)
+        if len(self.sampleIDs) != len(self.sources):
             raise InputError(kind="identifiers")
         self.grid = grid
         self.threads = checkedInteger(threads, "threads", 1, 65535)
@@ -321,7 +323,10 @@ class Reader:
                     info["selectedBarcodes"] = handle.selectedBarcodes
                     info["selectedCellCount"] = handle.selectedCellCount
                     info["chromosomeNames"] = tuple(handle.slices)
-                    info["chromosomeSizes"] = dict(grid.chromosomeSizes)
+                    info["chromosomeSizes"] = {
+                        chromosome: grid.chromosomeSizes[chromosome]
+                        for chromosome in handle.slices
+                    }
                     info["countOptions"] = None
                     info["unit"] = "storedBinCount"
                     info["countMode"] = None
@@ -631,7 +636,7 @@ class Reader:
             if kind in ("BAM", "FRAGMENTS"):
                 resolved = replace(resolved, countMode="center")
             countOptions[sampleID] = resolved
-            source = self.sources[self.sampleIDs.index(sampleID)]
+            source = self._sourcesByID[sampleID]
             unit = (
                 "storedBinCount"
                 if kind == "H5AD"
@@ -724,6 +729,8 @@ class Reader:
         if key not in self._sourceRanges:
             length = self.grid.chromosomeSizes[chromosome]
             if self._info[sampleID]["sourceKind"] == "H5AD":
+                if chromosome not in self._handles[sampleID].slices:
+                    raise SourceError(kind="missing", context=chromosome)
                 result = (0, length)
             else:
                 start, end = self._handles[sampleID].sourceRange(chromosome, flags)
@@ -741,8 +748,11 @@ class Reader:
         if sampleID not in self._info or chromosome not in self.grid.chromosomeSizes:
             raise SourceError(kind="missing")
         info = self._info[sampleID]
+        isH5AD = info["sourceKind"] == "H5AD"
+        if isH5AD and chromosome not in self._handles[sampleID].slices:
+            raise SourceError(kind="missing", context=chromosome)
         if chromosome not in info["chromosomeRanges"]:
-            if info["sourceKind"] == "H5AD":
+            if isH5AD:
                 result = (0, self.grid.chromosomeSizes[chromosome])
             else:
                 result = tuple(
@@ -855,15 +865,134 @@ class Reader:
                 )
 
     @_locked
-    def libraryTotals(self, *, chromosomes):
+    def commonFeatureTerritory(self, *, chromosomes, sampleIDs=None):
         self._checkOpen()
-        selected = selectedSamples(sorted(chromosomes), self.grid.chromosomeSizes)
-        if selected in self._totals:
-            return self._totals[selected]
+        requested = selectedSamples(sorted(chromosomes), self.grid.chromosomeSizes)
+        samples = selectedSamples(sampleIDs, self.sampleIDs)
+        missingBySource = {}
+        missing = set()
+        for sampleID in samples:
+            info = self._info[sampleID]
+            absent = ()
+            # Tabix indexes list chromosomes with records.
+            if info["sourceKind"] in ("BAM", "H5AD"):
+                available = set(info["chromosomeNames"])
+                absent = tuple(
+                    chromosome
+                    for chromosome in requested
+                    if chromosome not in available
+                )
+            missingBySource[sampleID] = absent
+            missing.update(absent)
+
+        return MappingProxyType(
+            {
+                "requestedChromosomes": requested,
+                "usedChromosomes": tuple(
+                    chromosome for chromosome in requested if chromosome not in missing
+                ),
+                "missingChromosomesBySource": MappingProxyType(missingBySource),
+            }
+        )
+
+    @_locked
+    def _regionEndpointTotals(self, regionPath, *, sampleIDs):
+        self._checkOpen()
+        samples = selectedSamples(sampleIDs, self.sampleIDs)
+        for sampleID in samples:
+            if self._info[sampleID]["sourceKind"] not in ("BAM", "FRAGMENTS"):
+                raise InputError(
+                    "Region normalization requires BAM or FRAGMENTS input",
+                    context=sampleID,
+                )
+
+        path = Path(regionPath)
+        sizes = self.grid.chromosomeSizes
+        intervals = {}
+        opener = gzip.open if path.suffix in (".gz", ".bgz") else open
+        with opener(path, "rt", encoding="utf-8") as handle:
+            for lineNumber, line in enumerate(handle, 1):
+                fields = line.split(maxsplit=3)
+                if not fields or fields[0].startswith("#"):
+                    continue
+                chromosome = fields[0]
+                if chromosome not in sizes and chromosome in ("track", "browser"):
+                    continue
+                context = f"{path}:{lineNumber}"
+                if len(fields) < 3:
+                    raise InputError(kind="region", context=context)
+                if chromosome not in sizes:
+                    raise SourceError(
+                        kind="missing", context=f"{context} ({chromosome})"
+                    )
+                try:
+                    start, end = int(fields[1]), int(fields[2])
+                except ValueError as error:
+                    raise InputError(kind="region", context=context) from error
+                if not 0 <= start < end <= sizes[chromosome]:
+                    raise InputError(kind="region", context=context)
+                intervals.setdefault(chromosome, []).append((start, end))
+        if not intervals:
+            raise InputError(kind="region", context=path)
+
+        territory = self.commonFeatureTerritory(chromosomes=intervals, sampleIDs=samples)
+        for sampleID, missing in territory["missingChromosomesBySource"].items():
+            if missing:
+                raise SourceError(kind="missing", context=f"{sampleID}/{missing[0]}")
+
+        merged = {}
+        for chromosome, ranges in intervals.items():
+            union = []
+            for start, end in sorted(ranges):
+                if union and start <= union[-1][1]:
+                    union[-1] = (union[-1][0], max(end, union[-1][1]))
+                else:
+                    union.append((start, end))
+            merged[chromosome] = np.asarray(union, dtype=np.int64)
 
         records = {}
-        for source in self.sources:
-            sampleID = source.sampleID
+        for sampleID in samples:
+            info = self._info[sampleID]
+            source = self._handles[sampleID]
+            options = replace(info["countOptions"], countMode="fiveprime")
+            mass = sum(
+                source.regionEndpointTotal(chromosome, ranges, options)
+                for chromosome, ranges in merged.items()
+            )
+            if mass <= 0:
+                raise EstimateError(
+                    "No endpoints in normalization regions", context=sampleID
+                )
+            records[sampleID] = MappingProxyType(
+                {
+                    "sourceKind": info["sourceKind"],
+                    "unit": info["unit"],
+                    "countMode": info["countMode"],
+                    "regionPath": str(path),
+                    "regionEndpointMass": mass,
+                }
+            )
+        return MappingProxyType(records)
+
+    @_locked
+    def libraryTotals(self, *, chromosomes, sampleIDs=None):
+        self._checkOpen()
+        selected = selectedSamples(sorted(chromosomes), self.grid.chromosomeSizes)
+        samples = selectedSamples(sampleIDs, self.sampleIDs)
+        key = (selected, samples)
+        if key in self._totals:
+            return self._totals[key]
+
+        for sampleID in samples:
+            if self._info[sampleID]["sourceKind"] == "H5AD":
+                features = self._handles[sampleID].slices
+                for chromosome in selected:
+                    if chromosome not in features:
+                        raise SourceError(kind="missing", context=chromosome)
+
+        records = {}
+        for sampleID in samples:
+            source = self._sourcesByID[sampleID]
             info = self._info[sampleID]
             handle = self._handles[sampleID]
             record = {
@@ -933,7 +1062,7 @@ class Reader:
             records[sampleID] = record
 
         result = LibraryTotals(records, self.grid, selected)
-        self._totals[selected] = result
+        self._totals[key] = result
         return result
 
 

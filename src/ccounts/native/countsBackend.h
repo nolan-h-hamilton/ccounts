@@ -48,6 +48,10 @@ int ccCount(ccSource *source, const char *chromosome, int64_t chromosomeLength,
 int ccRegionTotals(ccSource *source, const char *chromosome, int64_t chromosomeLength,
                    int64_t start, int64_t end, const ccOptions *options,
                    ccTotals *totals, const char **error);
+int ccRegionEndpointTotal(ccSource *source, const char *chromosome,
+                          int64_t chromosomeLength, const int64_t *regions,
+                          size_t regionCount, const ccOptions *options,
+                          double *total, const char **error);
 int ccInspect(ccSource *source, const ccOptions *options, int maxRecords,
               int *paired, const char **error);
 int ccReadLength(ccSource *source, const ccOptions *options, uint32_t *readLength,

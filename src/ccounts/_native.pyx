@@ -81,6 +81,8 @@ cdef extern from "native/countsBackend.h":
                 const ccOptions *, double *, double *, size_t, const char **) nogil
     int ccRegionTotals(ccSource *, const char *, int64_t, int64_t, int64_t,
                        const ccOptions *, ccTotals *, const char **) nogil
+    int ccRegionEndpointTotal(ccSource *, const char *, int64_t, const int64_t *,
+                              size_t, const ccOptions *, double *, const char **) nogil
     int ccInspect(ccSource *, const ccOptions *, int, int *, const char **) nogil
     int ccReadLength(ccSource *, const ccOptions *, uint32_t *, const char **) nogil
     int ccSourceRange(ccSource *, const char *, uint64_t, uint16_t, uint64_t *, uint64_t *, const char **) nogil
@@ -245,6 +247,28 @@ cdef class NativeSource:
             status = ccRegionTotals(self._source, namePointer, length, start, end, &parsed, &totals, &error)
         _raise(status, error)
         return {"scannedRecords": int(totals.scannedRecords), "eventMass": totals.eventMass, "spanBP": totals.spanBP}
+
+    def regionEndpointTotal(self, chromosome,
+                            cnp.ndarray[cnp.int64_t, ndim=2, mode="c"] intervals not None,
+                            options):
+        cdef bytes name = chromosome.encode("utf-8")
+        cdef const char *namePointer = name
+        cdef int64_t length
+        cdef size_t count = intervals.shape[0]
+        cdef ccOptions parsed = _options(options)
+        cdef double total
+        cdef int status
+        cdef const char *error = NULL
+        self._checkOpen()
+        length = self._sizes[chromosome]
+        if not count or intervals.shape[1] != 2 or not intervals.flags.aligned:
+            raise InputError(kind="region")
+        with nogil:
+            status = ccRegionEndpointTotal(
+                self._source, namePointer, length, <const int64_t *>intervals.data,
+                count, &parsed, &total, &error)
+        _raise(status, error)
+        return total
 
     def pairedEnd(self, options):
         cdef ccOptions parsed = _options(options)
