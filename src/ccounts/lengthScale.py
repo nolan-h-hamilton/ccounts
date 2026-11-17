@@ -31,25 +31,26 @@ class LengthScaleOptions:
     blockWidthBP : int
         Genomic block width in bp
     scaleStartBP : int or None
-        Smallest nominal filter width in bp. None uses the resolved bin size.
-    scaleEndBP : int
-        Nominal upper filter width in bp. Overridden by `blockWidthBP` if smaller
+        Smallest nominal filter width in bp, with a minimum of three bins.
+        None uses three bins.
+    scaleEndBP : int or None
+        Nominal upper filter width in bp, capped at `blockWidthBP`.
+        None uses `blockWidthBP`.
     scaleFactor : float
         Defines the increment in filter width size. Multiplies the previous width.
     smoothingRatio : float
-        Ratio of filter width to the smoothing window.
+        Reject a candidate if the unsmoothed peak in its surrounding filter
+        window is more than this many times the smoothed peak inside the candidate.
     significanceLevel : float
         Tail probability used for 'Poisson trimming' and the final binomial test.
     pValueWindowBP : int
         Reference width in bp for downscaling counts in longer candidates.
     backgroundWindowBP : int
         Window width in bp for computing the mean null or local 'background' count
-    bootstrapReplicates : int
-        Number of genomic block bootstrap draws. At least two.
     confidenceLevel : float
-        Nominal confidence level for percentile bootstrap intervals.
+        Nominal confidence level for IJ normal intervals.
     randomSeed : int
-        Seed for block sampling and bootstrap draws.
+        Seed for genomic block sampling.
     returnProfiles : bool
         Include the largest accepted filter width for each sample, block,
         and bin, with zero for unsupported bins.
@@ -60,7 +61,7 @@ class LengthScaleOptions:
     blockWidthBP: int = 500000
 
     scaleStartBP: int | None = None
-    scaleEndBP: int = 125_000
+    scaleEndBP: int | None = None
     scaleFactor: float = 1.5
 
     smoothingRatio: float = 4.0
@@ -78,10 +79,17 @@ class LengthScaleOptions:
         for name in (
             "blockCount",
             "blockWidthBP",
-            "scaleEndBP",
             "pValueWindowBP",
         ):
             object.__setattr__(self, name, checkedInteger(getattr(self, name), name, 1))
+
+        object.__setattr__(
+            self,
+            "scaleEndBP",
+            self.blockWidthBP
+            if self.scaleEndBP is None
+            else checkedInteger(self.scaleEndBP, "scaleEndBP", 1),
+        )
 
         object.__setattr__(
             self,
@@ -494,7 +502,7 @@ def _estimateLengthScale(
         3 * binSizeBP,
         0 if options.scaleStartBP is None else options.scaleStartBP,
     )
-    maximumWidth = min(125_000, options.scaleEndBP, options.blockWidthBP)
+    maximumWidth = min(options.scaleEndBP, options.blockWidthBP)
     if scaleStart > maximumWidth:
         raise InputError()
 

@@ -82,6 +82,6 @@ class EstimateWarning(_Message, RuntimeWarning):
         "boundary": "Estimate reaches a search boundary",
         "flat": "Estimate has a flat maximum",
         "nonpositive": "Estimate has a nonpositive maximum",
-        "fewFragments": "Insufficient paired fragments",
+        "fewFragments": "Insufficient paired fragments. Using the 147 bp fallback.",
         "fewBlocks": "Fewer eligible genomic blocks than requested",
     }

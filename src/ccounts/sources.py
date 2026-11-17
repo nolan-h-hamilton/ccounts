@@ -187,7 +187,7 @@ class CountOptions:
     flagExclude: int = 3844
     minMappingQuality: int = 20
     minTemplateLengthBP: int = 0
-    maxTemplateLengthBP: int | None = 2500
+    maxTemplateLengthBP: int | None = None
     shiftForward5p: int = 0
     shiftReverse5p: int = 0
     extendFrom5pBP: int | None = None

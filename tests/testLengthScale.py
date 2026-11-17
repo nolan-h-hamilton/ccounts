@@ -654,21 +654,33 @@ def testPhysicalFilterGrid():
         38900,
         58500,
         87700,
+        131500,
+        197100,
+        295700,
+        443500,
     ]
     options = cc.LengthScaleOptions()
-    assert options.scaleEndBP == 125000
+    assert options.scaleEndBP == options.blockWidthBP == 500000
 
     for binSizeBP, fields, expected in (
         (100, {}, defaultWidths),
         (100, {"scaleStartBP": 1, "scaleEndBP": 500000}, defaultWidths),
+        (100, {"scaleEndBP": 125000}, defaultWidths[:15]),
+        (100, {"scaleEndBP": 1000000}, defaultWidths),
+        (
+            100,
+            {"blockWidthBP": 1000000, "scaleEndBP": None},
+            defaultWidths + [665100, 997700],
+        ),
         (100, {"scaleStartBP": 301, "scaleEndBP": 2500}, [500, 700, 1100, 1500, 2300]),
         (100, {"scaleStartBP": 500, "scaleEndBP": 2500}, [500, 900, 1100, 1700]),
         (
             2000,
             {"scaleStartBP": 100000, "scaleEndBP": 250000, "scaleFactor": 1.25},
-            [102000],
+            [102000, 126000, 158000, 198000, 246000],
         ),
-        (41666, {"blockWidthBP": 416660}, [124998]),
+        (41666, {"blockWidthBP": 416660}, [124998, 208330, 291662]),
+        (41667, {"blockWidthBP": 416670}, [125001, 208335, 291669]),
     ):
         configured = replace(options, **fields)
         counts = np.zeros((1, 1, configured.blockWidthBP // binSizeBP), dtype=np.int64)
@@ -677,9 +689,10 @@ def testPhysicalFilterGrid():
 
         widths = result["settings"]["filterWidthsBP"]
         lower = max(3 * binSizeBP, configured.scaleStartBP or 0)
-        upper = min(125000, configured.scaleEndBP, configured.blockWidthBP)
+        upper = min(configured.scaleEndBP, configured.blockWidthBP)
         assert widths == expected
         assert result["settings"]["scaleStartBP"] == lower
+        assert result["settings"]["scaleEndBP"] == configured.scaleEndBP
         assert all(
             lower <= width <= upper
             and width % binSizeBP == 0
@@ -690,7 +703,6 @@ def testPhysicalFilterGrid():
     for binSizeBP, fields in (
         (100, {"blockWidthBP": 200}),
         (2000, {"scaleStartBP": 125000, "scaleEndBP": 125000}),
-        (41667, {"blockWidthBP": 416670}),
     ):
         configured = replace(options, **fields)
         counts = np.zeros((1, 1, configured.blockWidthBP // binSizeBP), dtype=np.int64)
@@ -800,8 +812,9 @@ def testInvalidCountsOptionsAndRegions():
         (True, cc.InputError),
         (1.5, TypeError),
     ):
-        with pytest.raises(error):
-            cc.LengthScaleOptions(backgroundWindowBP=width)
+        for field in ("backgroundWindowBP", "scaleEndBP"):
+            with pytest.raises(error):
+                cc.LengthScaleOptions(**{field: width})
 
     for counts in (
         np.zeros((1, 2)),
@@ -817,6 +830,7 @@ def testInvalidCountsOptionsAndRegions():
 
     for fields in (
         {"scaleFactor": 1},
+        {"blockWidthBP": 1000, "scaleStartBP": 1001, "scaleEndBP": None},
         {"confidenceLevel": 1},
         {"returnProfiles": 1},
         {"binSizeBP": 100, "blockWidthBP": 150},

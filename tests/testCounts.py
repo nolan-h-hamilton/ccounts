@@ -4,6 +4,7 @@ import math
 from shutil import copyfile
 from unittest.mock import patch
 import numpy as np
+import pysam
 import pytest
 import ccounts as cc
 from ccounts import _native
@@ -127,6 +128,30 @@ def testFixtureCountsAndNormalization(countSources, mode, values, mass, dtype):
         np.testing.assert_array_equal(distinct.values, expected)
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def testNormalizationFactorPrecision(dtype):
+    values = np.array([[2**100, -(2**100)], [2**-100, -(2**-100)]], dtype=dtype)
+    expected = np.array([[2**-50, -(2**-50)], [2**50, -(2**50)]], dtype=dtype)
+    block = cc.CountBlock(
+        values,
+        ("a", "b"),
+        cc.GridSpec({"chr1": 2}, 1),
+        "chr1",
+        0,
+        2,
+        ("eventMass", "eventMass"),
+        ("center", "center"),
+    )
+    normalization = cc.Normalization.fromFactors(block.sampleIDs, [2**-150, 2**150])
+
+    for target in (None, np.empty_like(values), values):
+        result = normalization.apply(block, out=target)
+        np.testing.assert_array_equal(result, expected)
+        assert result.dtype == values.dtype
+        if target is not None:
+            assert result is target
+
+
 @pytest.mark.parametrize("mode", ["coverage", "binOverlap"])
 @pytest.mark.parametrize(
     "name,length,expected",
@@ -187,6 +212,139 @@ def testSourceRange(countSources, tmp_path, path, kind, expected):
                 reader.sourceRange("s", "chrMissing", flagExclude=3844)
         else:
             assert reader.sourceRange("s", "chrMissing", flagExclude=3844) == (0, 0)
+
+
+@pytest.mark.parametrize("kind", ["BAM", "FRAGMENTS"])
+@pytest.mark.parametrize("chromosomeLength", [120, 2000000])
+def testSourceRangeNestedIntervals(tmp_path, kind, chromosomeLength):
+    if kind == "BAM":
+        path = tmp_path / "nested.bam"
+        header = {
+            "HD": {"VN": "1.6", "SO": "coordinate"},
+            "SQ": [{"SN": "chr1", "LN": chromosomeLength}],
+        }
+        with pysam.AlignmentFile(path, "wb", header=header) as handle:
+            for index, (start, end) in enumerate(((10, 100), (20, 30))):
+                record = pysam.AlignedSegment()
+                record.query_name = f"read{index}"
+                record.query_sequence = "A" * (end - start)
+                record.reference_id = 0
+                record.reference_start = start
+                record.mapping_quality = 60
+                record.cigartuples = [(0, end - start)]
+                handle.write(record)
+        pysam.index(str(path))
+    else:
+        raw = tmp_path / "nested.tsv"
+        raw.write_text("chr1\t10\t100\tA\t1\nchr1\t20\t30\tA\t1\n")
+        path = tmp_path / "nested.tsv.gz"
+        pysam.tabix_compress(str(raw), str(path))
+        pysam.tabix_index(str(path), preset="bed")
+
+    source = cc.SourceSpec(path, kind, "s")
+    with cc.openSources([source], cc.GridSpec({"chr1": chromosomeLength}, 10)) as reader:
+        assert reader.sourceRange("s", "chr1", flagExclude=3844) == (10, 100)
+
+
+@pytest.mark.parametrize("warmup", ["partial", "filtered", "reads", "totals"])
+def testUnboundedFragmentQueries(tmp_path, warmup):
+    sizes = {"chrShort": 4000, "chrLong": 40000, "chrEmpty": 4000}
+    path = tmp_path / "fragments.bam"
+    header = {
+        "HD": {"VN": "1.6", "SO": "coordinate"},
+        "SQ": [{"SN": name, "LN": length} for name, length in sizes.items()],
+    }
+    records = []
+
+    for tid, (length, span) in enumerate(((4000, 600), (40000, 8000))):
+        for index, (left, width, reverse, mapQ, extraFlags) in enumerate(
+            (
+                (100, 30, False, 60, 0),
+                (0, span, True, 0, 1024),
+                (length // 5 - 100, span, False, 0, 1024),
+                (length // 2 + 100, span, True, 0, 1024),
+                (length - span, span, False, 0, 1024),
+            )
+        ):
+            right = left + width - 10
+            mates = (
+                ((83, right, left, -width), (163, left, right, width))
+                if reverse
+                else ((99, left, right, width), (147, right, left, -width))
+            )
+            for flag, position, mate, templateLength in mates:
+                record = pysam.AlignedSegment()
+                record.query_name = f"pair{tid}_{index}"
+                record.query_sequence = "A" * 10
+                record.flag = flag | extraFlags
+                record.reference_id = tid
+                record.reference_start = position
+                record.mapping_quality = mapQ
+                record.cigar = [(0, 10)]
+                record.next_reference_id = tid
+                record.next_reference_start = mate
+                record.template_length = templateLength
+                records.append(record)
+
+    with pysam.AlignmentFile(path, "wb", header=header) as handle:
+        for record in sorted(
+            records, key=lambda item: (item.reference_id, item.reference_start)
+        ):
+            handle.write(record)
+    pysam.index(str(path))
+
+    native = _native.NativeSource(path, "BAM", sizes)
+    reference = _native.NativeSource(path, "BAM", sizes)
+    filtered = cc.CountOptions(
+        bamInputMode="fragments", minTemplateLengthBP=20, maxTemplateLengthBP=50
+    )
+
+    try:
+        if warmup == "partial":
+            native.countRegion("chrShort", 2800, 2900, 100, filtered)
+        elif warmup == "totals":
+            native.totalsRegion("chrShort", 0, 4000, filtered)
+        else:
+            options = (
+                replace(filtered, bamInputMode="reads")
+                if warmup == "reads"
+                else filtered
+            )
+            native.countRegion("chrShort", 0, 4000, 100, options)
+
+        # Longer fragments become eligible when the quality, flag, and length filters change.
+        for chromosome, length in sizes.items():
+            for mode in cc.countModes:
+                for maximum, shift in ((None, 0), (None, 150), (None, -150), (50, 0)):
+                    options = cc.CountOptions(
+                        bamInputMode="fragments",
+                        countMode=mode,
+                        flagExclude=0,
+                        minMappingQuality=0,
+                        maxTemplateLengthBP=maximum,
+                        shiftForward5p=shift,
+                        shiftReverse5p=shift,
+                    )
+                    expected = reference.countRegion(
+                        chromosome, 0, length, 100, options, True
+                    )
+                    pieces = [
+                        native.countRegion(
+                            chromosome, start, start + 1000, 100, options, True
+                        )
+                        for start in range(0, length, 1000)
+                    ]
+
+                    for field in (0, 1):
+                        np.testing.assert_allclose(
+                            np.concatenate([piece[field] for piece in pieces]),
+                            expected[field],
+                            rtol=1e-13,
+                            atol=1e-13,
+                        )
+    finally:
+        native.close()
+        reference.close()
 
 
 def testFixtureIndexesAndSelection(countSources, tmp_path):
@@ -370,15 +528,33 @@ def testLogDomainAndPrecision(dtype):
 def testFloat64SizeFactorsAndCatalogs():
     ratio = math.sqrt(1 + 2**-24)
 
-    for profile, expected in (
-        ([4, 16, 64], [4, 1, 0.25]),
-        ([2**24, 2**24 + 1], [ratio, 1 / ratio]),
+    for profile, options, expected in (
+        ([4, 16, 64], {"centerMedian": False}, [4, 1, 0.25]),
+        ([2**24, 2**24 + 1], {"centerMedian": False}, [ratio, 1 / ratio]),
+        ([1, 1000000], {}, [100, 0.01]),
+        ([1, 1000000], {"factorBounds": None}, [1000, 0.001]),
+        ([1, 4, 64], {"factorBounds": None}, [4, 1, 0.0625]),
+        ([1, 4, 64], {"factorBounds": [0.1, 2]}, [2, 1, 0.1]),
+        ([1, 4, 64], {"factorBounds": (3, 3)}, [3, 3, 3]),
     ):
         counts = np.tile(np.asarray(profile, dtype=np.float64)[:, None], (1, 100))
 
         np.testing.assert_allclose(
-            cc.estimateSizeFactors(counts, centerMedian=False), expected, rtol=1e-14
+            cc.estimateSizeFactors(counts, **options), expected, rtol=1e-14
         )
+
+    for bounds in (
+        (1,),
+        (1, 2, 3),
+        (0, 1),
+        (2, 1),
+        (1, np.inf),
+        (np.nan, 1),
+        (True, 1),
+        "15",
+    ):
+        with pytest.raises(cc.InputError):
+            cc.estimateSizeFactors(counts, factorBounds=bounds)
 
     for assembly, sizes in cc.assemblyChromosomeSizes.items():
         assert all(name in sizes for name in cc.standardChromosomes[assembly])

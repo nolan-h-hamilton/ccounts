@@ -40,7 +40,6 @@ cdef enum:
 
 cdef enum:
     pairedInspectSampleSize = 1000
-    defaultMaxTemplateLengthBP = 1000
 
 # log2(x) = log(x) * log2E
 cdef const double log2E = 1.4426950408889634074
@@ -83,7 +82,7 @@ cdef extern from "native/countsBackend.h":
     int ccRegionTotals(ccSource *, const char *, int64_t, int64_t, int64_t,
                        const ccOptions *, ccTotals *, const char **) nogil
     int ccInspect(ccSource *, const ccOptions *, int, int *, const char **) nogil
-    int ccReadLength(ccSource *, uint16_t, uint32_t *, const char **) nogil
+    int ccReadLength(ccSource *, const ccOptions *, uint32_t *, const char **) nogil
     int ccSourceRange(ccSource *, const char *, uint64_t, uint16_t, uint64_t *, uint64_t *, const char **) nogil
     int ccChromRange(ccSource *, const char *, int64_t, const ccOptions *, int64_t *, int64_t *, const char **) nogil
     ctypedef struct ccEndpointCounts:
@@ -258,13 +257,13 @@ cdef class NativeSource:
         return bool(paired)
 
     def readLength(self, options):
-        cdef uint16_t flagExclude = options.flagExclude
+        cdef ccOptions parsed = _options(options)
         cdef uint32_t length
         cdef int status
         cdef const char *error = NULL
         self._checkOpen()
         with nogil:
-            status = ccReadLength(self._source, flagExclude, &length, &error)
+            status = ccReadLength(self._source, &parsed, &length, &error)
         _raise(status, error)
         return int(length)
 
@@ -338,14 +337,15 @@ cdef class NativeSource:
             "retainedReverseEndpoints": int(counts.retainedReverseEndpoints)}
 
     def estimateFragmentLength(self, options, fragmentLengthOptions):
+        cdef ccOptions parsed = _options(options)
         self._checkOpen()
         if self.sourceKind != "BAM":
             raise SourceError()
-        if self.pairedEnd(options):
+        if options.bamInputMode == "fragments" or self.pairedEnd(options):
             started = perf_counter()
             result = _pairedFragmentLength(
-                self.path, self._threads, options.flagExclude,
-                defaultMaxTemplateLengthBP if options.maxTemplateLengthBP is None else options.maxTemplateLengthBP,
+                self.path, self._threads, parsed.flagExclude,
+                parsed.minMappingQuality, parsed.minTemplateLengthBP, parsed.maxTemplateLengthBP,
                 self._barcodeAllowListFile, self._barcodeTag)
             result.update({"method": "pairedTemplateMedian", "CILowerBP": None,
                            "CIUpperBP": None, "bootstrapStdBP": None, "warnings": [],

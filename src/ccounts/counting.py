@@ -294,7 +294,7 @@ class Reader:
         self._totals = {}
         self._closed = False
         self._selectionDir = TemporaryDirectory(prefix="countsCells_")
-        qualityWarning = False
+        qualityWarning = None
 
         try:
             for index, source in enumerate(self.sources):
@@ -376,7 +376,10 @@ class Reader:
                             length = int(diagnostics["estimateBP"])
                             info["fragmentLengthDiagnostics"] = diagnostics
                             if diagnostics["warnings"]:
-                                qualityWarning = True
+                                if diagnostics.get("status") == "insufficientData":
+                                    qualityWarning = EstimateWarning(kind="fewFragments")
+                                elif qualityWarning is None:
+                                    qualityWarning = EstimateWarning()
                             if length <= 0:
                                 raise EstimateError()
                             options = replace(
@@ -411,8 +414,8 @@ class Reader:
 
                 self._handles[source.sampleID] = handle
                 self._info[source.sampleID] = info
-            if qualityWarning:
-                warnings.warn(EstimateWarning(), stacklevel=2)
+            if qualityWarning is not None:
+                warnings.warn(qualityWarning, stacklevel=2)
         except BaseException:
             self.close()
             raise
@@ -491,7 +494,12 @@ class Reader:
             value = int(diagnostics["estimateBP"])
             info["fragmentLengthDiagnostics"] = diagnostics
             if diagnostics["warnings"]:
-                warnings.warn(EstimateWarning(), stacklevel=2)
+                warning = EstimateWarning(
+                    kind="fewFragments"
+                    if diagnostics.get("status") == "insufficientData"
+                    else None
+                )
+                warnings.warn(warning, stacklevel=2)
             if value <= 0:
                 raise EstimateError()
             info["fragmentLengthBP"] = value
@@ -516,9 +524,8 @@ class Reader:
           it qualified as enriched.
         * Return the average of these maximal filter widths.
 
-        Bootstrap confidence intervals are included with the returned estimate
-        for uncertainty quantification. The intervals may be conditional on
-        detected enrichment and may understate the full variability.
+        Confidence intervals use an infinitesimal jackknife (IJ) standard error
+        from the genomic blocks and a normal approximation.
 
         References
         ----------

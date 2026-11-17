@@ -13,6 +13,7 @@ cdef extern from "htslib/sam.h":
     ctypedef struct samFile
     ctypedef struct bam1_core_t:
         uint16_t flag
+        uint8_t qual
         int32_t l_qseq
         uint32_t n_cigar
         int64_t isize
@@ -44,6 +45,8 @@ cdef dict _pairedFragmentLength(
     str bamFile,
     uint16_t samThreads,
     uint16_t samFlagExclude,
+    int minMappingQuality,
+    int64_t minInsertSize,
     int64_t maxInsertSize,
     str barcodeAllowListFile,
     str barcodeTag,
@@ -51,10 +54,10 @@ cdef dict _pairedFragmentLength(
     cdef int readFlag, selected, status, kTop, contigTid, tlenN = 0
     cdef int64_t queryLength, contigLen, tlen, minimum, estimate
     cdef int readLengthCount = 0
-    cdef double readLengthSum = 0.0
     cdef Py_ssize_t contigIndex
-    cdef cnp.ndarray[cnp.int64_t, ndim=1] lengths, templateLengths
+    cdef cnp.ndarray[cnp.int64_t, ndim=1] lengths, templateLengths, readLengths
     cdef object orderedContigs
+    cdef object maximum = int(maxInsertSize) if maxInsertSize > 0 else None
     cdef bytes bamBytes = bamFile.encode("utf-8")
     cdef bytes allowBytes = barcodeAllowListFile.encode("utf-8")
     cdef bytes tagBytes = barcodeTag.encode("utf-8")
@@ -66,8 +69,7 @@ cdef dict _pairedFragmentLength(
     cdef crBarcodeSelection *selection = NULL
     cdef const char *selectionError = NULL
     cdef bint hasSelection = bool(barcodeAllowListFile)
-    if maxInsertSize < 1:
-        maxInsertSize = 1
+    minimum = minInsertSize
     fileHandle = sam_open(bamBytes, "r")
     if fileHandle == NULL:
         raise SourceError(kind="io")
@@ -92,50 +94,49 @@ cdef dict _pairedFragmentLength(
         kTop = header.n_targets if hasSelection else min(3, header.n_targets)
         orderedContigs = np.argpartition(lengths, -kTop)[-kTop:]
         orderedContigs = orderedContigs[np.argsort(lengths[orderedContigs])[::-1]]
-        for contigIndex in orderedContigs:
-            contigTid = <int>contigIndex
-            contigLen = lengths[contigTid]
-            if contigLen <= 0:
-                continue
-            iteratorHandle = sam_itr_queryi(indexHandle, contigTid, 0, contigLen)
-            if iteratorHandle == NULL:
-                raise SourceError(kind="io")
-            while True:
-                status = sam_itr_next(<htsFile *>fileHandle, iteratorHandle, record)
-                if status < 0:
-                    if status < -1:
-                        raise SourceError(kind="io")
-                    break
-                readFlag = record.core.flag
-                if readFlag & samFlagExclude:
+        if minimum < 0:
+            readLengths = np.empty(1000, dtype=np.int64)
+            for contigIndex in orderedContigs:
+                contigTid = <int>contigIndex
+                contigLen = lengths[contigTid]
+                if contigLen <= 0:
                     continue
-                if hasSelection and readFlag & 1 and not readFlag & 64:
-                    continue
-                selected = crBarcodeSelected(selection, record)
-                if selected < 0:
-                    raise InputError(kind="selection")
-                if not selected:
-                    continue
+                iteratorHandle = sam_itr_queryi(indexHandle, contigTid, 0, contigLen)
+                if iteratorHandle == NULL:
+                    raise SourceError(kind="io")
+                while True:
+                    status = sam_itr_next(<htsFile *>fileHandle, iteratorHandle, record)
+                    if status < 0:
+                        if status < -1:
+                            raise SourceError(kind="io")
+                        break
+                    readFlag = record.core.flag
+                    if readFlag & (samFlagExclude | 4) or record.core.qual < minMappingQuality:
+                        continue
+                    if hasSelection and readFlag & 1 and not readFlag & 64:
+                        continue
+                    selected = crBarcodeSelected(selection, record)
+                    if selected < 0:
+                        raise InputError(kind="selection")
+                    if not selected:
+                        continue
+                    queryLength = record.core.l_qseq
+                    if queryLength <= 0 and record.core.n_cigar > 0:
+                        queryLength = bam_cigar2qlen(record.core.n_cigar, bam_get_cigar(record))
+                    if queryLength <= 0:
+                        continue
+                    readLengths[readLengthCount] = queryLength
+                    readLengthCount += 1
+                    if readLengthCount >= 1000:
+                        break
+                hts_itr_destroy(iteratorHandle)
+                iteratorHandle = NULL
                 if readLengthCount >= 1000:
                     break
-                queryLength = record.core.l_qseq
-                if queryLength <= 0 and record.core.n_cigar > 0:
-                    queryLength = bam_cigar2qlen(record.core.n_cigar, bam_get_cigar(record))
-                if queryLength <= 0:
-                    continue
-                readLengthSum += queryLength
-                readLengthCount += 1
-            hts_itr_destroy(iteratorHandle)
-            iteratorHandle = NULL
-            if readLengthCount >= 1000:
-                break
-        if readLengthCount == 0:
-            if hasSelection:
-                raise EstimateError()
-            return {"estimateBP": 147, "status": "insufficientData", "retainedTemplateCount": 0,
-                    "minimumTemplateLengthBP": None, "maximumTemplateLengthBP": int(maxInsertSize)}
-        minimum = <int64_t>(readLengthSum / readLengthCount)
-        minimum = max(1, min(minimum, maxInsertSize))
+            if readLengthCount == 0:
+                return {"estimateBP": 147, "status": "insufficientData", "retainedTemplateCount": 0,
+                        "minimumTemplateLengthBP": None, "maximumTemplateLengthBP": maximum}
+            minimum = int(np.median(readLengths[:readLengthCount]))
         templateLengths = np.empty(2000, dtype=np.int64)
         for contigIndex in orderedContigs:
             if tlenN >= 2000:
@@ -156,7 +157,8 @@ cdef dict _pairedFragmentLength(
                 if tlenN >= 2000:
                     break
                 readFlag = record.core.flag
-                if readFlag & samFlagExclude or not readFlag & 64:
+                if (readFlag & (samFlagExclude | 4) or not readFlag & 64
+                        or record.core.qual < minMappingQuality):
                     continue
                 selected = crBarcodeSelected(selection, record)
                 if selected < 0:
@@ -168,20 +170,18 @@ cdef dict _pairedFragmentLength(
                     raise NumericalError()
                 if tlen < 0:
                     tlen = -tlen
-                if tlen == 0 or tlen < minimum or tlen > maxInsertSize:
+                if tlen == 0 or tlen < minimum or (maxInsertSize > 0 and tlen > maxInsertSize):
                     continue
                 templateLengths[tlenN] = tlen
                 tlenN += 1
             hts_itr_destroy(iteratorHandle)
             iteratorHandle = NULL
         if tlenN < (1 if hasSelection else 500):
-            if hasSelection:
-                raise EstimateError()
             return {"estimateBP": 147, "status": "insufficientData", "retainedTemplateCount": tlenN,
-                    "minimumTemplateLengthBP": int(minimum), "maximumTemplateLengthBP": int(maxInsertSize)}
+                    "minimumTemplateLengthBP": int(minimum), "maximumTemplateLengthBP": maximum}
         estimate = np.partition(templateLengths[:tlenN], tlenN // 2)[tlenN // 2]
         return {"estimateBP": int(estimate), "status": "observedTemplate", "retainedTemplateCount": tlenN,
-                "minimumTemplateLengthBP": int(minimum), "maximumTemplateLengthBP": int(maxInsertSize)}
+                "minimumTemplateLengthBP": int(minimum), "maximumTemplateLengthBP": maximum}
     finally:
         crBarcodeSelectionDestroy(selection)
         if iteratorHandle != NULL:

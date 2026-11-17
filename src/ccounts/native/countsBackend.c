@@ -31,6 +31,11 @@ struct ccSource {
     int nameCount;                 ///< number of reference sequences
 
     uint32_t readLengthBP;         ///< cached sampled median read length in bp, 0 if unset
+    uint16_t readLengthFlags;
+    int readLengthMinMappingQuality;
+    int readLengthBAMMode;
+
+    int64_t *maximumTemplateLengths; ///< per-chromosome query padding, -1 until a full scan
 };
 
 /** @brief Span, counting points, and weight for one read/fragment. */
@@ -89,10 +94,12 @@ static int ccParseInteger(const char **cursor, int64_t *value) {
     if (!**cursor || isspace((unsigned char)**cursor)) return -1;
 
     parsed = strtoll(*cursor, &stop, 10);
-    if (stop == *cursor || errno == ERANGE || (*stop && !isspace((unsigned char)*stop))) return -1;
+    if (stop == *cursor || errno == ERANGE ||
+        (*stop && !isspace((unsigned char)*stop))) return -1;
 
     *value = (int64_t)parsed;
     *cursor = stop;
+
     return 0;
 }
 
@@ -105,6 +112,7 @@ static int ccColumns(char *line, char **fields, int limit) {
         if (!*cursor) break;
 
         fields[count++] = cursor;
+
         while (*cursor && !isspace((unsigned char)*cursor)) ++cursor;
         if (*cursor) *cursor++ = '\0';
     }
@@ -121,6 +129,7 @@ static int ccParseCoordinate(const char *field, int64_t *value) {
 static int ccBarcodeAllowed(const ccSource *source, const char *barcode) {
     if (!source->selection || !source->selection->active) return 1;
     if (!source->selection->count) return 0;
+
     return bsearch(&barcode, source->selection->barcodes, source->selection->count,
                    sizeof(char *), crBarcodeCompare) != NULL;
 }
@@ -129,12 +138,14 @@ static int ccBasicRecord(ccSource *source, bam1_t *record,
                          const ccOptions *options, const char **error) {
     int selected;
 
-    if ((record->core.flag & BAM_FUNMAP) || record->core.tid < 0 ||
+    if ((record->core.flag & BAM_FUNMAP) ||
+        record->core.tid < 0 ||
         (record->core.flag & options->flagExclude) ||
         record->core.qual < options->minMappingQuality) return 0;
 
     if (options->bamInputMode == 2 &&
-        (!(record->core.flag & BAM_FPAIRED) || !(record->core.flag & BAM_FREAD1) ||
+        (!(record->core.flag & BAM_FPAIRED) ||
+         !(record->core.flag & BAM_FREAD1) ||
          (record->core.flag & BAM_FMUNMAP))) return 0;
 
     selected = crBarcodeSelected(source->selection, record);
@@ -162,17 +173,31 @@ static int ccResolveBAM(ccSource *source, bam1_t *record, int64_t chromosomeLeng
     if (options->bamInputMode == 1) {
         if (!(record->core.flag & BAM_FPROPER_PAIR) ||
             !(record->core.flag & BAM_FREAD1) ||
-            (record->core.flag & BAM_FMUNMAP) || record->core.mtid != record->core.tid) return 0;
+            (record->core.flag & BAM_FMUNMAP) ||
+            record->core.mtid != record->core.tid) return 0;
 
         length = record->core.isize;
         if (length == INT64_MIN) return ccFail(error, ccInvalidNumerics);
         if (length < 0) length = -length;
-        if (!length || (options->maxTemplateLengthBP > 0 && length > options->maxTemplateLengthBP)) return 0;
 
-        if (options->minTemplateLengthBP < 0 && !source->readLengthBP) {
-            if (ccReadLength(source, options->flagExclude |
-                    (source->selection->active ? BAM_FREAD2 : 0),
-                    &source->readLengthBP, error) != 0) return -1;
+        if (!length || (options->maxTemplateLengthBP > 0 &&
+                        length > options->maxTemplateLengthBP)) return 0;
+
+        if (options->minTemplateLengthBP < 0) {
+            uint16_t readLengthFlags = options->flagExclude |
+                (source->selection->active ? BAM_FREAD2 : 0);
+
+            if (!source->readLengthBP ||
+                    source->readLengthFlags != readLengthFlags ||
+                    source->readLengthMinMappingQuality != options->minMappingQuality ||
+                    source->readLengthBAMMode != options->bamInputMode) {
+
+                ccOptions readOptions = *options;
+                readOptions.flagExclude = readLengthFlags;
+
+                if (ccReadLength(source, &readOptions, &source->readLengthBP, error) != 0)
+                    return -1;
+            }
         }
 
         if (length < (options->minTemplateLengthBP < 0 ?
@@ -185,6 +210,7 @@ static int ccResolveBAM(ccSource *source, bam1_t *record, int64_t chromosomeLeng
             right = readEnd + shift;
             left = right - length;
         }
+
     } else if (options->extendFrom5pBP > 0) {
         if (reverse) {
             right = fivePrime + 1;
@@ -242,15 +268,19 @@ static int ccResolveFragment(ccSource *source, char *line, int64_t chromosomeLen
     int n = ccColumns(line, fields, 6), a, b;
     int64_t left, right, multiplicity = 1;
 
-    if (n < 4 || ccParseCoordinate(fields[1], &left) ||
-        ccParseCoordinate(fields[2], &right) || right <= left || !*fields[3])
+    if (n < 4 ||
+        ccParseCoordinate(fields[1], &left) ||
+        ccParseCoordinate(fields[2], &right) ||
+        right <= left || !*fields[3])
         return ccFail(error, ccInvalidFile);
 
     *owner = left;
     if (!ccBarcodeAllowed(source, fields[3])) return 0;
 
     if (options->fragmentsUseReadSupport &&
-        (n < 5 || ccParseCoordinate(fields[4], &multiplicity) || multiplicity <= 0))
+        (n < 5 ||
+         ccParseCoordinate(fields[4], &multiplicity) ||
+         multiplicity <= 0))
         return ccFail(error, ccInvalidCounts);
 
     event->multiplicity = (double)multiplicity;
@@ -269,6 +299,7 @@ static int ccResolveFragment(ccSource *source, char *line, int64_t chromosomeLen
 
     if (options->countMode >= 2 && options->countMode <= 4) {
         a = 0;
+
         for (b = 0; b < event->pointCount; ++b) {
             if (event->point[b] >= 0 && event->point[b] < chromosomeLength)
                 event->point[a++] = event->point[b];
@@ -281,6 +312,10 @@ static int ccResolveFragment(ccSource *source, char *line, int64_t chromosomeLen
     return event->end > event->start;
 }
 
+/**
+ * @brief Bin one read/fragment's points in [work->start, work->end),
+ * scaled by event->multiplicity.
+ */
 static void ccPoint(ccWork *work, const ccEvent *event) {
     int k;
     int64_t bins[2] = {-1, -1};
@@ -288,14 +323,21 @@ static void ccPoint(ccWork *work, const ccEvent *event) {
     for (k = 0; k < event->pointCount; ++k) {
         int64_t p = event->point[k];
 
-        if (p >= work->start && p < work->end) bins[k] = (p - work->start) / work->binSize;
+        if (p >= work->start && p < work->end)
+            bins[k] = (p - work->start) / work->binSize;
     }
 
     if (bins[0] >= 0) {
         int same = event->pointCount == 2 && bins[0] == bins[1];
 
+        // Count both endpoints if they land in this bin, otherwise just one
         work->values[bins[0]] += event->multiplicity * (same ? 2.0 : 1.0);
+
+        // For N fragments with both ends in the bin, left/right endpoint counts are L=R=N.
+        // Cov(L,R)=Var(N), so Var(L+R)=Var(L)+Var(R)+2*Cov(L,R)=4*Var(N).
+        // Assuming Poisson sampling, estimate Var(N) := N --> add 4 per fragment.
         if (work->mass) work->mass[bins[0]] += event->multiplicity * (same ? 4.0 : 1.0);
+
         if (same) return;
     }
 
@@ -305,6 +347,26 @@ static void ccPoint(ccWork *work, const ccEvent *event) {
     }
 }
 
+/**
+ * @brief Keep rounding leftovers when adding to a running total.
+ *
+ * high holds the rounded total. low keeps what was too small to fit there.
+ * Start both at zero and read the total as high + low.
+ *
+ * @verbatim
+ *   add        high        low
+ *   +2^54      2^54         0
+ *   +1         2^54         1   <- too small to change high
+ *   -2^54         1         0   <- the saved 1 survives
+ * @endverbatim
+ *
+ * In contrast, naive double addition would yields 0 for this example.
+ *
+ * @param[in] value Amount to add
+ * @param[in,out] high Rounded part of the total
+ * @param[in,out] low Rounding leftovers carried between calls.
+ * @see Ogita, Rump and Oishi, Accurate Sum and Dot Product, Algorithm 3.1.
+ */
 static void ccAccumulate(double value, double *high, double *low) {
     double total = *high + value;
     double removed = total - *high;
@@ -336,15 +398,24 @@ static void ccSpan(ccWork *work, const ccEvent *event) {
 
         if (work->options->countMode == 0) {
             binStart = work->start + first * work->binSize;
-            binEnd = ccMin(work->start + (last + 1) * work->binSize, work->chromosomeLength);
+            binEnd = ccMin(
+                work->start + (last + 1) * work->binSize, work->chromosomeLength
+            );
+
             if (left > binStart) ++firstFull;
             if (right < binEnd) --stopFull;
         }
 
         if (firstFull < stopFull) {
             if (work->interiorCorrection) {
-                ccAccumulate(event->multiplicity, &work->interior[firstFull], &work->interiorCorrection[firstFull]);
-                ccAccumulate(-event->multiplicity, &work->interior[stopFull], &work->interiorCorrection[stopFull]);
+                ccAccumulate(
+                    event->multiplicity, &work->interior[firstFull],
+                    &work->interiorCorrection[firstFull]
+                );
+                ccAccumulate(
+                    -event->multiplicity, &work->interior[stopFull],
+                    &work->interiorCorrection[stopFull]
+                );
             } else {
                 work->interior[firstFull] += event->multiplicity;
                 work->interior[stopFull] -= event->multiplicity;
@@ -362,19 +433,30 @@ static void ccSpan(ccWork *work, const ccEvent *event) {
 
         binStart = work->start + j * work->binSize;
         binEnd = ccMin(binStart + work->binSize, work->chromosomeLength);
+
         weight = (double)(ccMin(right, binEnd) - ccMax(left, binStart));
-        weight /= (double)(work->options->countMode == 0 ? binEnd - binStart : event->end - event->start);
+        weight /= (double)(work->options->countMode == 0 ?
+            binEnd - binStart : event->end - event->start);
 
         work->values[j] += event->multiplicity * weight;
         if (work->mass) work->mass[j] += event->multiplicity * weight * weight;
     }
 }
 
+/**
+ * @brief Add one accepted read/fragment to totals or bin counts, using its
+ * multiplicity and the selected counting mode.
+ * Also, we track the leftmost start and rightmost end of accepted nonempty spans
+ * through `work`'s rangeStart and rangeEnd fields.
+ */
 static void ccConsume(ccWork *work, const ccEvent *event) {
     if (work->totals) {
         work->totals->eventMass += event->multiplicity *
-            (work->options->countMode >= 2 && work->options->countMode <= 4 ? event->pointCount : 1);
-        work->totals->spanBP += event->multiplicity * (double)ccMax(0, event->end - event->start);
+            (work->options->countMode >= 2 && work->options->countMode <= 4 ?
+                event->pointCount : 1);
+        work->totals->spanBP += event->multiplicity *
+            (double)ccMax(0, event->end - event->start);
+
     } else if (work->options->countMode >= 2 && work->options->countMode <= 4) {
         ccPoint(work, event);
     } else {
@@ -382,7 +464,9 @@ static void ccConsume(ccWork *work, const ccEvent *event) {
     }
 
     if (event->end > event->start) {
-        if (work->rangeStart < 0 || event->start < work->rangeStart) work->rangeStart = event->start;
+        if (work->rangeStart < 0 || event->start < work->rangeStart)
+            work->rangeStart = event->start;
+
         if (event->end > work->rangeEnd) work->rangeEnd = event->end;
     }
 }
@@ -410,8 +494,9 @@ static void ccConsume(ccWork *work, const ccEvent *event) {
 static int ccVisit(ccSource *source, const char *chromosome, int64_t chromosomeLength,
                     int64_t start, int64_t end, const ccOptions *options,
                     ccWork *work, int owned, const char **error) {
-    int tid, status, accepted;
+    int tid, status, accepted, collectTemplateLengths;
     int64_t queryStart = start, queryEnd = end, padding = 0, owner;
+    int64_t templatePadding, observedTemplateLength, maximumTemplateLength = 0;
     hts_itr_t *iterator = NULL;
     bam1_t *record = NULL;
     kstring_t line = {0, 0, NULL};
@@ -422,15 +507,39 @@ static int ccVisit(ccSource *source, const char *chromosome, int64_t chromosomeL
         if (tid < 0) return 0;
 
         if (!owned) {
-            padding = ccMax(llabs(options->shiftForward5p), llabs(options->shiftReverse5p));
-            padding += options->extendFrom5pBP;
+            padding = ccMax(
+                llabs(options->shiftForward5p), llabs(options->shiftReverse5p));
+            padding = ccMin(padding, chromosomeLength);
+
+            if (options->extendFrom5pBP >= chromosomeLength - padding)
+                padding = chromosomeLength;
+            else
+                padding += options->extendFrom5pBP;
+
             if (options->bamInputMode == 1 && options->countMode != 4) {
-                if (options->maxTemplateLengthBP <= 0) padding = chromosomeLength;
-                else padding += options->maxTemplateLengthBP;
+                templatePadding = options->maxTemplateLengthBP;
+
+                if (templatePadding <= 0) {
+                    templatePadding = source->maximumTemplateLengths[tid];
+                    // The first unbounded query scans the chromosome to learn its bound
+                    if (templatePadding < 0) templatePadding = chromosomeLength;
+                }
+
+                if (templatePadding >= chromosomeLength - padding)
+                    padding = chromosomeLength;
+                else
+                    padding += templatePadding;
             }
-            queryStart = ccMax(0, start - padding);
-            queryEnd = ccMin(chromosomeLength, end + padding);
+
+            queryStart = start > padding ? start - padding : 0;
+            queryEnd = padding >= chromosomeLength - end
+                ? chromosomeLength
+                : end + padding;
         }
+
+        collectTemplateLengths = queryStart == 0 &&
+            queryEnd == chromosomeLength &&
+            source->maximumTemplateLengths[tid] < 0;
 
         iterator = sam_itr_queryi(source->index, tid, queryStart, queryEnd);
         if (!iterator) return ccFail(error, ccInputQueryFailed);
@@ -442,22 +551,45 @@ static int ccVisit(ccSource *source, const char *chromosome, int64_t chromosomeL
         }
 
         while ((status = sam_itr_next(source->file, iterator, record)) >= 0) {
+            if (collectTemplateLengths) {
+                // include rejected reads so changing filters cannot hide longer fragments
+                observedTemplateLength = record->core.isize;
+
+                if (observedTemplateLength == INT64_MIN) {
+                    observedTemplateLength = chromosomeLength;
+                } else {
+                    if (observedTemplateLength < 0)
+                        observedTemplateLength = -observedTemplateLength;
+                    observedTemplateLength = ccMin(
+                        observedTemplateLength, chromosomeLength);
+                }
+
+                if (observedTemplateLength > maximumTemplateLength)
+                    maximumTemplateLength = observedTemplateLength;
+            }
+
             if ((record->core.flag & BAM_FUNMAP) || record->core.tid < 0) continue;
             owner = record->core.pos;
 
             if (owned && (owner < start || owner >= end)) continue;
 
             if (work->totals) ++work->totals->scannedRecords;
-            accepted = ccResolveBAM(source, record, chromosomeLength, options, &event, error);
+            accepted = ccResolveBAM(
+                source, record, chromosomeLength, options, &event, error);
+
             if (accepted < 0) {
                 status = -2;
                 break;
             }
+
             if (accepted) ccConsume(work, &event);
         }
 
         bam_destroy1(record);
         hts_itr_destroy(iterator);
+
+        if (collectTemplateLengths && status == -1)
+            source->maximumTemplateLengths[tid] = maximumTemplateLength;
 
         if (status < -1) return *error ? -1 : ccFail(error, ccInputReadFailed);
         return 0;
@@ -474,8 +606,11 @@ static int ccVisit(ccSource *source, const char *chromosome, int64_t chromosomeL
     iterator = tbx_itr_queryi(source->tabix, tid, queryStart, queryEnd);
     if (!iterator) return ccFail(error, ccInputQueryFailed);
 
-    while ((status = tbx_itr_next(source->file, source->tabix, iterator, &line)) >= 0) {
-        accepted = ccResolveFragment(source, line.s, chromosomeLength, options, &event, &owner, error);
+    while ((status = tbx_itr_next(
+                source->file, source->tabix, iterator, &line)) >= 0) {
+        accepted = ccResolveFragment(
+            source, line.s, chromosomeLength, options, &event, &owner, error);
+
         if (accepted < 0) {
             status = -2;
             break;
@@ -502,18 +637,23 @@ static int ccBedGraphLine(char *line, char **chromosome, int64_t *start,
     if (ccMeta(line)) return 0;
 
     n = ccColumns(line, fields, 5);
-    if (n != 4 || ccParseCoordinate(fields[1], start) || ccParseCoordinate(fields[2], end) || *end <= *start)
+    if (n != 4 ||
+            ccParseCoordinate(fields[1], start) ||
+            ccParseCoordinate(fields[2], end) ||
+            *end <= *start)
         return ccFail(error, ccInvalidBEDGRAPH);
 
     errno = 0;
     *value = strtod(fields[3], &stop);
-    if (stop == fields[3] || *stop || !isfinite(*value)) return ccFail(error, ccInvalidBEDGRAPH);
+    if (stop == fields[3] || *stop || !isfinite(*value))
+        return ccFail(error, ccInvalidBEDGRAPH);
 
     *chromosome = fields[0];
     return 1;
 }
 
-static int ccValidateBedGraph(ccSource *source, const char *path, int threads, const char **error) {
+static int ccValidateBedGraph(ccSource *source, const char *path,
+                              int threads, const char **error) {
     int status, parsed, tid = -1, nextTid;
     int64_t left, right, lastEnd = -1;
     double value;
@@ -529,6 +669,7 @@ static int ccValidateBedGraph(ccSource *source, const char *path, int threads, c
             status = -2;
             break;
         }
+
         if (!parsed) continue;
 
         nextTid = tbx_name2id(source->tabix, chromosome);
@@ -544,6 +685,7 @@ static int ccValidateBedGraph(ccSource *source, const char *path, int threads, c
                 status = -2;
                 break;
             }
+
             seen[nextTid] = 1;
             tid = nextTid;
             lastEnd = -1;
@@ -554,6 +696,7 @@ static int ccValidateBedGraph(ccSource *source, const char *path, int threads, c
             status = -2;
             break;
         }
+
         lastEnd = right;
     }
 
@@ -573,6 +716,7 @@ static int ccValidateBedGraph(ccSource *source, const char *path, int threads, c
 int ccOpen(const char *path, int kind, const char *allowPath, const char *tag,
            int threads, ccSource **out, const char **error) {
     ccSource *source = calloc(1, sizeof(ccSource));
+    int referenceIndex;
 
     *out = NULL;
     if (!source) return ccFail(error, ccAllocationFailed);
@@ -612,13 +756,32 @@ int ccOpen(const char *path, int kind, const char *allowPath, const char *tag,
             ccClose(source);
             return ccFail(error, ccMissingIndex);
         }
+
         source->nameCount = sam_hdr_nref(source->header);
+        if (source->nameCount) {
+            if ((size_t)source->nameCount >
+                    SIZE_MAX / sizeof(*source->maximumTemplateLengths)) {
+                ccClose(source);
+                return ccFail(error, ccAllocationFailed);
+            }
+
+            source->maximumTemplateLengths = malloc(
+                (size_t)source->nameCount * sizeof(*source->maximumTemplateLengths));
+            if (!source->maximumTemplateLengths) {
+                ccClose(source);
+                return ccFail(error, ccAllocationFailed);
+            }
+
+            for (referenceIndex = 0; referenceIndex < source->nameCount; ++referenceIndex)
+                source->maximumTemplateLengths[referenceIndex] = -1;
+        }
     } else {
         source->tabix = tbx_index_load(path);
         if (!source->tabix) {
             ccClose(source);
             return ccFail(error, ccMissingIndex);
         }
+
         source->names = tbx_seqnames(source->tabix, &source->nameCount);
 
         if (kind == 2 && ccValidateBedGraph(source, path, threads, error) != 0) {
@@ -637,6 +800,7 @@ void ccClose(ccSource *source) {
     if (source->index) hts_idx_destroy(source->index);
     if (source->tabix) tbx_destroy(source->tabix);
     if (source->names) free(source->names);
+    free(source->maximumTemplateLengths);
     if (source->header) sam_hdr_destroy(source->header);
     if (source->file) hts_close(source->file);
     crBarcodeSelectionDestroy(source->selection);
@@ -647,7 +811,9 @@ void ccClose(ccSource *source) {
 int ccChromosomeCount(ccSource *source) { return source->nameCount; }
 
 const char *ccChromosomeName(ccSource *source, int index) {
-    return source->kind == 0 ? sam_hdr_tid2name(source->header, index) : source->names[index];
+    return source->kind == 0
+        ? sam_hdr_tid2name(source->header, index)
+        : source->names[index];
 }
 
 int64_t ccChromosomeLength(ccSource *source, int index) {
@@ -679,11 +845,15 @@ int ccCount(ccSource *source, const char *chromosome, int64_t chromosomeLength,
     if (source->kind == 2) {
         tid = tbx_name2id(source->tabix, chromosome);
         if (tid < 0) return 0;
+
         iterator = tbx_itr_queryi(source->tabix, tid, start, end);
         if (!iterator) return ccFail(error, ccInputQueryFailed);
 
-        while ((status = tbx_itr_next(source->file, source->tabix, iterator, &line)) >= 0) {
-            parsed = ccBedGraphLine(line.s, &recordChromosome, &left, &right, &value, error);
+        while ((status = tbx_itr_next(
+                    source->file, source->tabix, iterator, &line)) >= 0) {
+            parsed = ccBedGraphLine(
+                line.s, &recordChromosome, &left, &right, &value, error);
+
             if (parsed < 0) {
                 status = -2;
                 break;
@@ -702,10 +872,13 @@ int ccCount(ccSource *source, const char *chromosome, int64_t chromosomeLength,
 
             first = (left - start) / binSize;
             last = (right - 1 - start) / binSize;
+
             for (j = first; j <= last; ++j) {
                 binStart = start + j * binSize;
                 binEnd = ccMin(binStart + binSize, chromosomeLength);
-                values[j] += value * ((double)(ccMin(right, binEnd) - ccMax(left, binStart)) / (double)(binEnd - binStart));
+                values[j] += value *
+                    ((double)(ccMin(right, binEnd) - ccMax(left, binStart)) /
+                     (double)(binEnd - binStart));
             }
         }
 
@@ -729,13 +902,15 @@ int ccCount(ccSource *source, const char *chromosome, int64_t chromosomeLength,
         }
     }
 
-    status = ccVisit(source, chromosome, chromosomeLength, start, end, options, &work, 0, error);
+    status = ccVisit(
+        source, chromosome, chromosomeLength, start, end, options, &work, 0, error);
 
     if (work.interior) {
         for (k = 0; k < count; ++k) {
             if (work.interiorCorrection) {
                 ccAccumulate(work.interior[k], &running, &correction);
-                ccAccumulate(work.interiorCorrection[k], &running, &correction);
+                ccAccumulate(
+                    work.interiorCorrection[k], &running, &correction);
                 contribution = running + correction;
             } else {
                 running += work.interior[k];
@@ -765,7 +940,8 @@ int ccRegionTotals(ccSource *source, const char *chromosome, int64_t chromosomeL
     work.totals = totals;
     work.rangeStart = -1;
 
-    return ccVisit(source, chromosome, chromosomeLength, start, end, options, &work, 1, error);
+    return ccVisit(
+        source, chromosome, chromosomeLength, start, end, options, &work, 1, error);
 }
 
 static int ccCompareReadLengths(const void *first, const void *second) {
@@ -775,17 +951,29 @@ static int ccCompareReadLengths(const void *first, const void *second) {
     return (left > right) - (left < right);
 }
 
-int ccReadLength(ccSource *source, uint16_t flagExclude, uint32_t *readLength,
+int ccReadLength(ccSource *source, const ccOptions *options, uint32_t *readLength,
                  const char **error) {
     samFile *fileHandle = NULL;
     sam_hdr_t *header = NULL;
     bam1_t *record = NULL;
     uint32_t lengths[100];
-    int readCount = 0, iterCount = 0, selected, midIndex, result = 0;
+    int readCount = 0, iterCount = 0, accepted, midIndex, result = 0;
     hts_pos_t queryLength;
 
+    if (source->kind != 0) {
+        *readLength = 0;
+        return ccFail(error, ccInvalidSource);
+    }
+
+    if (source->readLengthBP &&
+        source->readLengthFlags == options->flagExclude &&
+        source->readLengthMinMappingQuality == options->minMappingQuality &&
+        source->readLengthBAMMode == options->bamInputMode) {
+        *readLength = source->readLengthBP;
+        return 0;
+    }
+
     *readLength = 0;
-    if (source->kind != 0) return ccFail(error, ccInvalidSource);
 
     fileHandle = sam_open(source->file->fn, "r");
     if (!fileHandle) return ccFail(error, ccInputOpenFailed);
@@ -805,17 +993,18 @@ int ccReadLength(ccSource *source, uint16_t flagExclude, uint32_t *readLength,
     while ((source->selection->active ? readCount : iterCount) < 1000 &&
            sam_read1(fileHandle, header, record) >= 0) {
         ++iterCount;
-        if (record->core.flag & flagExclude) continue;
-        selected = crBarcodeSelected(source->selection, record);
-        if (selected < 0) {
-            result = ccFail(error, ccInvalidBarcodeType);
+        accepted = ccBasicRecord(source, record, options, error);
+        if (accepted < 0) {
+            result = -1;
             goto finish;
         }
-        if (!selected) continue;
+
+        if (!accepted) continue;
 
         queryLength = record->core.l_qseq;
         if (queryLength <= 0 && record->core.n_cigar > 0)
-            queryLength = bam_cigar2qlen(record->core.n_cigar, bam_get_cigar(record));
+            queryLength = bam_cigar2qlen(
+                record->core.n_cigar, bam_get_cigar(record));
         if (queryLength <= 0) continue;
 
         lengths[readCount++] = (uint32_t)queryLength;
@@ -831,12 +1020,17 @@ int ccReadLength(ccSource *source, uint16_t flagExclude, uint32_t *readLength,
     midIndex = readCount / 2;
     *readLength = (readCount & 1) ? lengths[midIndex] :
         (uint32_t)((lengths[midIndex - 1] + lengths[midIndex]) / 2U);
+
     source->readLengthBP = *readLength;
+    source->readLengthFlags = options->flagExclude;
+    source->readLengthMinMappingQuality = options->minMappingQuality;
+    source->readLengthBAMMode = options->bamInputMode;
 
 finish:
     if (record) bam_destroy1(record);
     if (header) sam_hdr_destroy(header);
     sam_close(fileHandle);
+
     return result;
 }
 
@@ -854,13 +1048,15 @@ int ccInspect(ccSource *source, const ccOptions *options, int maxRecords,
     if (!record) return ccFail(error, ccAllocationFailed);
 
     for (t = 0; t < source->nameCount && sampled < maxRecords; ++t) {
-        iterator = sam_itr_queryi(source->index, t, 0, sam_hdr_tid2len(source->header, t));
+        iterator = sam_itr_queryi(
+            source->index, t, 0, sam_hdr_tid2len(source->header, t));
         if (!iterator) {
             bam_destroy1(record);
             return ccFail(error, ccInputQueryFailed);
         }
 
-        while (sampled < maxRecords && (status = sam_itr_next(source->file, iterator, record)) >= 0) {
+        while (sampled < maxRecords &&
+               (status = sam_itr_next(source->file, iterator, record)) >= 0) {
             accepted = ccBasicRecord(source, record, options, error);
             if (accepted < 0) {
                 hts_itr_destroy(iterator);
@@ -868,6 +1064,7 @@ int ccInspect(ccSource *source, const ccOptions *options, int maxRecords,
                 bam_destroy1(record);
                 return -1;
             }
+
             if (!accepted) continue;
 
             ++sampled;
@@ -882,6 +1079,7 @@ int ccInspect(ccSource *source, const ccOptions *options, int maxRecords,
     }
 
     bam_destroy1(record);
+
     return 0;
 }
 
@@ -893,6 +1091,7 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
     hts_itr_t *iteratorHandle = NULL;
     int32_t tid = -1;
     uint64_t tailStart = 0;
+    uint64_t alignmentEnd;
     int seenAlignment = 0;
     int seenTailAlignment = 0;
 
@@ -900,6 +1099,7 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
     {
         *startOut = 0;
     }
+
     if (endOut != NULL)
     {
         *endOut = 0;
@@ -922,18 +1122,24 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
             return ccFail(error, ccClosedSource);
         }
 
-        snprintf(regionBuffer, sizeof(regionBuffer), "%s:%d-%llu", chromosome, 1, (unsigned long long)chromLength);
+        snprintf(regionBuffer, sizeof(regionBuffer), "%s:%d-%llu",
+                 chromosome, 1, (unsigned long long)chromLength);
         bedGraphIterator = tbx_itr_querys(source->tabix, regionBuffer);
         if (bedGraphIterator != NULL)
         {
-            while (tbx_itr_next(source->file, source->tabix, bedGraphIterator, &lineBuffer) >= 0)
+            while (tbx_itr_next(source->file, source->tabix,
+                               bedGraphIterator, &lineBuffer) >= 0)
             {
-                if (ccMeta(lineBuffer.s) || ccColumns(lineBuffer.s, fields, 3) < 3 ||
-                    ccParseCoordinate(fields[1], &bgStart) || ccParseCoordinate(fields[2], &bgEnd) ||
-                    bgEnd <= bgStart || strcmp(fields[0], chromosome))
+                if (ccMeta(lineBuffer.s) ||
+                    ccColumns(lineBuffer.s, fields, 3) < 3 ||
+                    ccParseCoordinate(fields[1], &bgStart) ||
+                    ccParseCoordinate(fields[2], &bgEnd) ||
+                    bgEnd <= bgStart ||
+                    strcmp(fields[0], chromosome))
                 {
                     continue;
                 }
+
                 if (!seenRecord)
                 {
                     minStart = (uint64_t)bgStart;
@@ -952,9 +1158,12 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
                     }
                 }
             }
+
             hts_itr_destroy(bedGraphIterator);
         }
+
         free(lineBuffer.s);
+
         if (startOut != NULL && seenRecord)
         {
             *startOut = minStart;
@@ -963,6 +1172,7 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
         {
             *endOut = maxEnd;
         }
+
         return 0;
     }
 
@@ -981,18 +1191,22 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
             return ccFail(error, ccMissingIndex);
         }
 
-        snprintf(regionBuffer, sizeof(regionBuffer), "%s:%d-%llu", chromosome, 1, (unsigned long long)chromLength);
+        snprintf(regionBuffer, sizeof(regionBuffer), "%s:%d-%llu",
+                 chromosome, 1, (unsigned long long)chromLength);
         iteratorHandle = tbx_itr_querys(source->tabix, regionBuffer);
         if (iteratorHandle != NULL)
         {
-            while (tbx_itr_next(source->file, source->tabix, iteratorHandle, &lineBuffer) >= 0)
+            while (tbx_itr_next(source->file, source->tabix,
+                               iteratorHandle, &lineBuffer) >= 0)
             {
                 if (ccColumns(lineBuffer.s, fields, 3) < 3 ||
-                    ccParseCoordinate(fields[1], &fragStart) || ccParseCoordinate(fields[2], &fragEnd) ||
+                    ccParseCoordinate(fields[1], &fragStart) ||
+                    ccParseCoordinate(fields[2], &fragEnd) ||
                     fragEnd <= fragStart)
                 {
                     continue;
                 }
+
                 if (!seenFragment)
                 {
                     if (startOut != NULL)
@@ -1001,14 +1215,18 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
                     }
                     seenFragment = 1;
                 }
-                if (endOut != NULL)
+
+                if (endOut != NULL && (uint64_t)fragEnd > *endOut)
                 {
                     *endOut = (uint64_t)fragEnd;
                 }
             }
+
             hts_itr_destroy(iteratorHandle);
         }
+
         free(lineBuffer.s);
+
         return 0;
     }
 
@@ -1038,6 +1256,7 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
             {
                 continue;
             }
+
             if (startOut != NULL)
             {
                 *startOut = (uint64_t)record->core.pos;
@@ -1046,9 +1265,11 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
             {
                 *endOut = (uint64_t)bam_endpos(record);
             }
+
             seenAlignment = 1;
             break;
         }
+
         hts_itr_destroy(iteratorHandle);
     }
 
@@ -1066,12 +1287,18 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
             {
                 continue;
             }
+
             if (endOut != NULL)
             {
-                *endOut = (uint64_t)bam_endpos(record);
+                alignmentEnd = (uint64_t)bam_endpos(record);
+                if (alignmentEnd > *endOut)
+                {
+                    *endOut = alignmentEnd;
+                }
             }
             seenTailAlignment = 1;
         }
+
         hts_itr_destroy(iteratorHandle);
     }
 
@@ -1092,16 +1319,23 @@ int ccSourceRange(ccSource *source, const char *chromosome, uint64_t chromLength
                 {
                     continue;
                 }
+
                 if (endOut != NULL)
                 {
-                    *endOut = (uint64_t)bam_endpos(record);
+                    alignmentEnd = (uint64_t)bam_endpos(record);
+                    if (alignmentEnd > *endOut)
+                    {
+                        *endOut = alignmentEnd;
+                    }
                 }
             }
+
             hts_itr_destroy(iteratorHandle);
         }
     }
 
     bam_destroy1(record);
+
     return 0;
 }
 
@@ -1127,8 +1361,10 @@ int ccChromRange(ccSource *source, const char *chromosome, int64_t chromosomeLen
         iterator = tbx_itr_queryi(source->tabix, tid, 0, chromosomeLength);
         if (!iterator) return ccFail(error, ccInputQueryFailed);
 
-        while ((status = tbx_itr_next(source->file, source->tabix, iterator, &line)) >= 0) {
-            parsed = ccBedGraphLine(line.s, &recordChromosome, &left, &right, &value, error);
+        while ((status = tbx_itr_next(
+                    source->file, source->tabix, iterator, &line)) >= 0) {
+            parsed = ccBedGraphLine(
+                line.s, &recordChromosome, &left, &right, &value, error);
             if (parsed < 0) {
                 status = -2;
                 break;
@@ -1156,10 +1392,12 @@ int ccChromRange(ccSource *source, const char *chromosome, int64_t chromosomeLen
     work.totals = &totals;
     work.rangeStart = -1;
 
-    status = ccVisit(source, chromosome, chromosomeLength, 0, chromosomeLength, options, &work, 1, error);
+    status = ccVisit(source, chromosome, chromosomeLength, 0, chromosomeLength,
+                     options, &work, 1, error);
 
     *start = work.rangeStart < 0 ? 0 : work.rangeStart;
     *end = work.rangeStart < 0 ? 0 : work.rangeEnd;
+
     return status;
 }
 
@@ -1190,6 +1428,7 @@ int ccBlockEndpoints(ccSource *source, const char *chromosome, int64_t start,
     memset(counts, 0, sizeof(*counts));
 
     if (source->kind != 0) return ccFail(error, ccInvalidSource);
+
     tid = sam_hdr_name2tid(source->header, chromosome);
     if (tid < 0) return ccFail(error, ccMissingSource);
     if (start < 0 || end <= start || end > sam_hdr_tid2len(source->header, tid))
@@ -1206,7 +1445,8 @@ int ccBlockEndpoints(ccSource *source, const char *chromosome, int64_t start,
 
     while ((status = sam_itr_next(source->file, iterator, record)) >= 0) {
         ++counts->queriedRecords;
-        if ((record->core.flag & (options->flagExclude | BAM_FUNMAP)) || record->core.tid < 0) {
+        if ((record->core.flag & (options->flagExclude | BAM_FUNMAP)) ||
+            record->core.tid < 0) {
             ++counts->excludedFlags;
             continue;
         }
@@ -1221,6 +1461,7 @@ int ccBlockEndpoints(ccSource *source, const char *chromosome, int64_t start,
             status = -2;
             break;
         }
+
         if (!accepted) {
             ++counts->excludedSelection;
             continue;
@@ -1228,11 +1469,13 @@ int ccBlockEndpoints(ccSource *source, const char *chromosome, int64_t start,
 
         strand = (record->core.flag & BAM_FREVERSE) != 0;
         if (strand) {
-            if (bam_cigar2rlen(record->core.n_cigar, bam_get_cigar(record)) <= 0) {
+            if (bam_cigar2rlen(
+                    record->core.n_cigar, bam_get_cigar(record)) <= 0) {
                 ccFail(error, ccInvalidFile);
                 status = -2;
                 break;
             }
+
             position = bam_endpos(record);
             if (position <= start || position > end) {
                 ++counts->outsideEndpointOwnership;
@@ -1295,13 +1538,16 @@ int ccBlockEndpoints(ccSource *source, const char *chromosome, int64_t start,
 
     counts->retainedForwardEndpoints = count[0];
     counts->retainedReverseEndpoints = count[1];
-    counts->removedForwardCoordinateDuplicates = counts->preDedupForwardRecords - count[0];
-    counts->removedReverseCoordinateDuplicates = counts->preDedupReverseRecords - count[1];
+    counts->removedForwardCoordinateDuplicates =
+        counts->preDedupForwardRecords - count[0];
+    counts->removedReverseCoordinateDuplicates =
+        counts->preDedupReverseRecords - count[1];
 
     *forward = endpoints[0];
     *reverse = endpoints[1];
     *nF = count[0];
     *nR = count[1];
+
     return 0;
 }
 
@@ -1313,13 +1559,16 @@ int ccBuildIndex(const char *path, int kind, const char *targetPath,
     int status, closed;
 
     if (kind == 0) {
-        if (sam_index_build3(path, NULL, 0, threads) != 0) return ccFail(error, ccIndexBuildFailed);
+        if (sam_index_build3(path, NULL, 0, threads) != 0)
+            return ccFail(error, ccIndexBuildFailed);
+
         return 0;
     }
 
     if (kind == 1) {
         if (tbx_index_build3(path, NULL, 0, threads, &tbx_conf_bed) != 0)
             return ccFail(error, ccIndexBuildFailed);
+
         return 0;
     }
 
@@ -1340,7 +1589,9 @@ int ccBuildIndex(const char *path, int kind, const char *targetPath,
 
     while ((status = hts_getline(input, '\n', &line)) >= 0) {
         if (ccMeta(line.s)) continue;
-        if (bgzf_write(output, line.s, line.l) != (ssize_t)line.l || bgzf_write(output, "\n", 1) != 1) {
+
+        if (bgzf_write(output, line.s, line.l) != (ssize_t)line.l ||
+            bgzf_write(output, "\n", 1) != 1) {
             free(line.s);
             bgzf_close(output);
             hts_close(input);
@@ -1356,5 +1607,6 @@ int ccBuildIndex(const char *path, int kind, const char *targetPath,
 
     if (tbx_index_build3(targetPath, NULL, 0, threads, &tbx_conf_bed) != 0)
         return ccFail(error, ccIndexBuildFailed);
+
     return 0;
 }

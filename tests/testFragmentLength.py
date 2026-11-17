@@ -2,6 +2,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 import warnings
 import numpy as np
+import pysam
 import pytest
 import ccounts as cc
 from ccounts import _native
@@ -299,3 +300,221 @@ def testEstimatorSettingsAndFailures():
                 repetitions=128,
                 randomSeed=73,
             )
+
+
+@pytest.fixture
+def fragmentBAM(tmp_path):
+    def write(groups, *, paired=True):
+        length = (sum(group[0] for group in groups) + 1) * 4096
+        header = {
+            "HD": {"VN": "1.6", "SO": "coordinate"},
+            "SQ": [{"SN": "chr1", "LN": length}],
+        }
+        path = tmp_path / "fragments.bam"
+        recordIndex = 0
+        with pysam.AlignmentFile(path, "wb", header=header) as output:
+            for count, span, readLength, mapQ, extraFlags, barcode in groups:
+                for _ in range(count):
+                    start = recordIndex * 4096
+                    aligned = min(readLength, span) if paired else readLength
+                    mates = (
+                        (
+                            (99, start, start + span - aligned, span),
+                            (147, start + span - aligned, start, -span),
+                        )
+                        if paired
+                        else ((0, start, -1, 0),)
+                    )
+                    for flag, position, mate, templateLength in mates:
+                        record = pysam.AlignedSegment()
+                        record.query_name = f"read{recordIndex}"
+                        record.query_sequence = "A" * readLength
+                        record.query_qualities = pysam.qualitystring_to_array(
+                            "I" * readLength
+                        )
+                        record.flag = flag | extraFlags
+                        record.reference_id = 0
+                        record.reference_start = position
+                        record.mapping_quality = mapQ
+                        record.cigar = [(0, aligned)]
+                        if aligned < readLength:
+                            record.cigar += [(4, readLength - aligned)]
+                        record.next_reference_id = 0 if paired else -1
+                        record.next_reference_start = mate
+                        record.template_length = templateLength
+                        record.set_tag("CB", barcode)
+                        output.write(record)
+                    recordIndex += 1
+        pysam.index(str(path))
+        return path, length
+
+    return write
+
+
+@pytest.mark.parametrize(
+    "groups,optionFields,selection,expected",
+    [
+        (
+            [(600, 3000, 20, 60, 0, "A")],
+            {},
+            None,
+            (3000, 600, 0, None),
+        ),
+        (
+            [(600, 100, 20, 60, 0, "A"), (600, 600, 20, 60, 0, "A")],
+            {"minTemplateLengthBP": 500, "maxTemplateLengthBP": 2500},
+            None,
+            (600, 600, 500, 2500),
+        ),
+        ([(600, 10, 20, 60, 0, "A")], {}, None, (10, 600, 0, None)),
+        (
+            [(600, 10, 20, 60, 0, "A"), (600, 60, 20, 60, 0, "A")],
+            {"minTemplateLengthBP": -1},
+            None,
+            (60, 600, 20, None),
+        ),
+        (
+            [
+                (600, 100, 20, 60, 0, "A"),
+                (1200, 300, 20, 0, 0, "A"),
+                (1200, 500, 20, 60, 1024, "A"),
+                (1200, 600, 20, 60, 0, "B"),
+            ],
+            {},
+            ("A",),
+            (100, 600, 0, None),
+        ),
+        (
+            [(1, 100, 20, 60, 0, "A"), (600, 300, 20, 60, 0, "B")],
+            {},
+            ("A",),
+            (100, 1, 0, None),
+        ),
+        (
+            [(600, 3000, 20, 60, 0, "A")],
+            {"maxTemplateLengthBP": 100},
+            None,
+            (147, 0, 0, 100),
+        ),
+        (
+            [(600, 3000, 20, 60, 0, "A")],
+            {"maxTemplateLengthBP": 100},
+            ("A",),
+            (147, 0, 0, 100),
+        ),
+        (
+            [(600, 100, 20, 0, 0, "A")],
+            {"minTemplateLengthBP": -1},
+            ("A",),
+            (147, 0, None, None),
+        ),
+        ([(1, 100, 20, 60, 0, "A")], {}, None, (147, 1, 0, None)),
+    ],
+    ids=[
+        "unbounded",
+        "minimum",
+        "zeroMinimum",
+        "readMedianMinimum",
+        "filters",
+        "selectedMinimum",
+        "noTemplates",
+        "selectedNoTemplates",
+        "excludedMappingQuality",
+        "fewTemplates",
+    ],
+)
+def testPairedFragmentFilters(
+    fragmentBAM,
+    groups,
+    optionFields,
+    selection,
+    expected,
+):
+    path, length = fragmentBAM(groups)
+    source = cc.SourceSpec(
+        path,
+        "BAM",
+        "s",
+        cc.CountOptions(bamInputMode="fragments", **optionFields),
+        selection=selection,
+    )
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always", EstimateWarning)
+        with cc.openSources([source], cc.GridSpec({"chr1": length})) as reader:
+            estimate = reader.estimateFragmentLength("s")
+            diagnostics = reader.sourceInfo["s"]["fragmentLengthDiagnostics"]
+            assert reader.estimateFragmentLength("s") == estimate
+
+    assert (
+        estimate,
+        diagnostics["retainedTemplateCount"],
+        diagnostics["minimumTemplateLengthBP"],
+        diagnostics["maximumTemplateLengthBP"],
+    ) == expected
+    expectedCount = expected[1]
+    insufficient = selection is None and expectedCount < 500 or expectedCount == 0
+    expectedWarnings = (
+        ["Insufficient paired fragments. Using the 147 bp fallback."]
+        if insufficient
+        else []
+    )
+    assert [item.category for item in emitted] == (
+        [EstimateWarning] if insufficient else []
+    )
+    if insufficient:
+        assert "147" in str(emitted[0].message)
+    assert diagnostics["warnings"] == expectedWarnings
+
+
+def testReadLengthUsesEndpointFilters(fragmentBAM, tmp_path):
+    path, length = fragmentBAM(
+        [
+            (100, 0, 100, 0, 0, "A"),
+            (100, 0, 80, 60, 1024, "A"),
+            (100, 0, 60, 60, 0, "B"),
+            (10, 0, 10, 60, 0, "A"),
+            (10, 0, 10, 60, 16, "A"),
+        ],
+        paired=False,
+    )
+    allowPath = tmp_path / "allow.txt"
+    allowPath.write_text("A\n")
+    native = _native.NativeSource(
+        path, "BAM", {"chr1": length}, barcodeAllowListFile=str(allowPath)
+    )
+    options = cc.CountOptions(bamInputMode="reads")
+    try:
+        assert native.readLength(options) == 10
+        assert native.readLength(replace(options, minMappingQuality=0)) == 100
+        assert native.readLength(options) == 10
+        assert native.readLength(replace(options, flagExclude=0)) == 80
+        assert native.readLength(options) == 10
+        forward, reverse, counts = native.blockEndpoints("chr1", 0, length, options)
+    finally:
+        native.close()
+
+    assert forward.size == reverse.size == 10
+    assert [
+        counts[field]
+        for field in ("excludedFlags", "excludedMappingQuality", "excludedSelection")
+    ] == [100, 100, 100]
+
+
+def testPairedFallbackOnOpen(fragmentBAM):
+    path, length = fragmentBAM([(600, 3000, 20, 60, 0, "A")])
+    source = cc.SourceSpec(
+        path,
+        "BAM",
+        "s",
+        cc.CountOptions(
+            bamInputMode="reads", maxTemplateLengthBP=100, inferFragmentLength=True
+        ),
+    )
+    with warnings.catch_warnings(record=True) as emitted:
+        warnings.simplefilter("always", EstimateWarning)
+        with cc.openSources([source], cc.GridSpec({"chr1": length})) as reader:
+            assert reader.estimateFragmentLength("s") == 147
+            assert reader.sourceInfo["s"]["countOptions"].extendFrom5pBP == 147
+    assert len(emitted) == 1
+    assert emitted[0].category is EstimateWarning
+    assert "147" in str(emitted[0].message)

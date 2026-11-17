@@ -9,12 +9,21 @@ from .exceptions import EstimateError, InputError, SourceError
 from .checks import checkedInteger, checkedReal, checkOutputArray, selectedSamples
 
 
-def estimateSizeFactors(counts, *, centerMedian=True, minRefDist=10):
+def estimateSizeFactors(
+    counts, *, centerMedian=True, minRefDist=10, factorBounds=(0.01, 100.0)
+):
     values = np.asarray(counts)
     if values.ndim != 2 or not all(values.shape) or values.dtype.kind not in "iuf":
         raise InputError(kind="array")
     if type(centerMedian) is not bool:
         raise InputError(kind="option", context="centerMedian")
+    if factorBounds is not None:
+        bounds = np.asarray(factorBounds, dtype=object)
+        if bounds.shape != (2,):
+            raise InputError(kind="option", context="factorBounds")
+        lower, upper = (checkedReal(value, "factorBounds") for value in bounds)
+        if not 0 < lower <= upper:
+            raise InputError(kind="option", context="factorBounds")
 
     distance = checkedInteger(minRefDist, "minRefDist", 0)
     sampleCount, binCount = values.shape
@@ -57,11 +66,12 @@ def estimateSizeFactors(counts, *, centerMedian=True, minRefDist=10):
             work -= referenceLog
             factors[sourceIndex] = np.exp(np.median(work, overwrite_input=True))
 
-    np.clip(factors, 0.2, 5.0, out=factors)
     if centerMedian:
-        factors /= np.exp(np.median(np.log(factors + 1e-8)))
-        np.clip(factors, 0.2, 5.0, out=factors)
+        factors /= np.exp(np.median(np.log(factors)))
     np.reciprocal(factors, out=factors)
+    if factorBounds is not None:
+        # Bounds apply to the multipliers we return.
+        np.clip(factors, lower, upper, out=factors)
     return factors
 
 
@@ -241,7 +251,7 @@ class Normalization:
                 factor = self.sourceFactors[index]
                 if self.widthRules[index]:
                     factor /= block.grid.binSizeBP
-                np.multiply(row, float(factor), out=target[index])
+                np.multiply(row, factor, out=target[index], dtype=np.float64)
         return target
 
     def forPair(self, treatmentID, referenceID, *, fixReference=False):
