@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from bisect import bisect_left
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -29,7 +30,11 @@ from .exceptions import (
 )
 from .normalization import LibraryTotals
 from .fragmentLength import FragmentLengthOptions
-from .lengthScale import LengthScaleOptions, _estimateLengthScale
+from .lengthScale import (
+    LengthScaleOptions,
+    _estimateLengthScale,
+    _lengthScaleExclusions,
+)
 
 
 def _locked(method):
@@ -501,6 +506,7 @@ class Reader:
         regions=None,
         excludeRanges=None,
         bedGraphCounts=False,
+        summaryFunction=np.mean,
     ):
         r"""Estimate a length scale for enriched regions (based on MUSIC).
 
@@ -534,66 +540,71 @@ class Reader:
         if width % binSize:
             raise InputError(kind="region")
 
-        exclusions = {}
-        for chromosome, intervals in (
-            {} if excludeRanges is None else excludeRanges
-        ).items():
-            if chromosome not in grid.chromosomeSizes:
-                raise SourceError(kind="missing", context=chromosome)
-            checked = []
-            for start, end in intervals:
-                start = checkedInteger(start, "exclusion startBP")
-                end = checkedInteger(
-                    end, "exclusion endBP", 1, grid.chromosomeSizes[chromosome]
-                )
-                if start >= end or (checked and start < checked[-1][1]):
-                    raise InputError(kind="region")
-                checked.append((start, end))
-            exclusions[chromosome] = checked
+        assembly, exclusions = _lengthScaleExclusions(
+            grid.chromosomeSizes, excludeRanges
+        )
 
         explicit = regions is not None
-        candidateRegions = (
-            list(regions)
-            if explicit
-            else [
-                (chromosome, start, start + width)
-                for chromosome, length in grid.chromosomeSizes.items()
-                for start in range(0, length - width + 1, width)
-            ]
-        )
-        eligible = []
         excluded = 0
-        for chromosome, start, end in candidateRegions:
-            start, end = grid.checkRegion(chromosome, start, end)
-            if end - start != width or end % binSize:
-                raise InputError(kind="region")
-            overlap = any(
-                start < stop and end > begin
-                for begin, stop in exclusions.get(chromosome, ())
-            )
-            if overlap:
-                if explicit:
+        if explicit:
+            chosen = []
+            for chromosome, start, end in regions:
+                start, end = grid.checkRegion(chromosome, start, end)
+                if end - start != width or end % binSize:
                     raise InputError(kind="region")
-                excluded += 1
-                continue
-            eligible.append((chromosome, start, end))
-        if not eligible:
-            raise EstimateError(kind="insufficient")
+                intervals = exclusions.get(chromosome, ())
+                position = bisect_left(intervals, (end,))
+                if position > 0 and intervals[position - 1][1] > start:
+                    raise InputError(kind="region")
+                chosen.append((chromosome, start, end))
+            eligibleCount = len(chosen)
+        else:
+            startRanges = []
+            rangeEnds = []
+            eligibleCount = 0
+            candidateCount = 0
+            for chromosome, length in grid.chromosomeSizes.items():
+                candidateCount += max(0, (length - width) // binSize + 1)
+                spanStart = 0
+                for left, right in (*exclusions.get(chromosome, ()), (length, length)):
+                    # The whole block has to fit inside this unmasked span.
+                    first = (spanStart + binSize - 1) // binSize
+                    stop = (left - width) // binSize + 1
+                    if stop > first:
+                        startRanges.append((chromosome, first))
+                        eligibleCount += stop - first
+                        rangeEnds.append(eligibleCount)
+                    spanStart = right
+            excluded = candidateCount - eligibleCount
 
-        chosen = (
-            eligible
-            if explicit
-            else [
-                eligible[int(i)]
-                for i in sorted(
-                    np.random.default_rng(options.randomSeed).choice(
-                        len(eligible),
-                        min(options.blockCount, len(eligible)),
-                        replace=False,
-                    )
+        if not eligibleCount:
+            raise EstimateError(kind="insufficient")
+        if not explicit and eligibleCount < options.blockCount:
+            warnings.warn(
+                EstimateWarning(
+                    kind="fewBlocks",
+                    context=(
+                        f"{eligibleCount} available, {options.blockCount} requested"
+                    ),
+                ),
+                stacklevel=3,
+            )
+
+        if not explicit:
+            # Rank valid starts even when their blocks overlap.
+            ranks = np.sort(
+                np.random.default_rng(options.randomSeed).choice(
+                    eligibleCount, min(options.blockCount, eligibleCount), replace=False
                 )
-            ]
-        )
+            )
+            rangeEnds = np.asarray(rangeEnds, dtype=np.int64)
+            rangeIndices = np.searchsorted(rangeEnds, ranks, side="right")
+            chosen = []
+            for rank, index in zip(ranks, rangeIndices):
+                chromosome, first = startRanges[index]
+                offset = int(rank) - (int(rangeEnds[index - 1]) if index else 0)
+                start = (first + offset) * binSize
+                chosen.append((chromosome, start, start + width))
 
         sourceInfo = {}
         countOptions = {}
@@ -669,12 +680,17 @@ class Reader:
 
         sampling = {
             "explicitRegions": explicit,
-            "eligibleBlockCount": len(eligible),
+            "samplingMethod": (
+                "explicitRegions" if explicit else "uniformStartsWithoutReplacement"
+            ),
+            "eligibleBlockCount": eligibleCount,
             "selectedBlockCount": len(chosen),
             "excludedBlockCount": excluded,
             "terminalBP": sum(
-                length % width for length in grid.chromosomeSizes.values()
+                length if length < width else length % binSize
+                for length in grid.chromosomeSizes.values()
             ),
+            "exclusionAssembly": assembly,
             "excludeRanges": exclusions,
         }
         result = _estimateLengthScale(
@@ -686,6 +702,7 @@ class Reader:
             chosen,
             sourceInfo,
             sampling,
+            summaryFunction=summaryFunction,
         )
         result["runtimeSeconds"] = perf_counter() - started
         return result

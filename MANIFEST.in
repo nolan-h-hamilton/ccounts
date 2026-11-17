@@ -2,7 +2,11 @@ include LICENSE
 include HTSLIB_LICENSE.txt
 include HTSCODECS_LICENSE.md
 include ZLIB_LICENSE.txt
-recursive-include src/ccounts *.pyx *.pxi *.h *.c
+recursive-include src/ccounts *.pyx *.pxd *.pxi *.h *.c
+recursive-include src/ccounts/data/gaps *.bed.gz *.json
+recursive-include src/ccounts/mappability *.npz *.json
+include scripts/buildMappability.py scripts/buildMappability.cpp
+include scripts/verifyMappability.py
 graft vendor/htslib
 prune vendor/htslib/.git
 prune vendor/htslib/.github

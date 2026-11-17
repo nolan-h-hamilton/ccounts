@@ -186,7 +186,7 @@ class CountOptions:
     bamInputMode: str = "auto"
     flagExclude: int = 3844
     minMappingQuality: int = 20
-    minTemplateLengthBP: int = -1
+    minTemplateLengthBP: int = 0
     maxTemplateLengthBP: int | None = 2500
     shiftForward5p: int = 0
     shiftReverse5p: int = 0

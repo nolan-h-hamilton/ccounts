@@ -69,8 +69,9 @@ class BuildNative(build_ext):
 
         subprocess.run(["make", "-C", str(buildDir), "-j2", "lib-static"], check=True)
         for extension in self.extensions:
-            extension.include_dirs.extend([str(buildDir), str(buildDir / "htslib")])
-            extension.extra_objects.append(str(buildDir / "libhts.a"))
+            if extension.name == "ccounts._native":
+                extension.include_dirs.extend([str(buildDir), str(buildDir / "htslib")])
+                extension.extra_objects.append(str(buildDir / "libhts.a"))
         super().build_extensions()
 
 
@@ -86,7 +87,15 @@ extension = Extension(
     extra_objects=[],
     extra_compile_args=["-O3", "-fno-trapping-math", "-fno-math-errno"],
 )
+mappabilityExtension = Extension(
+    "ccounts._mappability",
+    sources=["src/ccounts/_mappability.pyx"],
+    include_dirs=[numpy.get_include()],
+    extra_compile_args=["-O3", "-fno-trapping-math", "-fno-math-errno"],
+)
 setup(
-    ext_modules=cythonize([extension], build_dir="build/cython", language_level="3"),
+    ext_modules=cythonize(
+        [extension, mappabilityExtension], build_dir="build/cython", language_level="3"
+    ),
     cmdclass={"build_ext": BuildNative},
 )

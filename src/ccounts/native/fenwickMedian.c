@@ -67,3 +67,49 @@ int ccMedianProfile(const intptr_t *valueIndices, size_t nBins,
     free(tree);
     return 0;
 }
+
+int ccCorrectMappabilityCounts(const int64_t *signal, const uint8_t *donors,
+                               const intptr_t *valueIndices, size_t nBins,
+                               const int64_t *values, size_t nValues,
+                               size_t radius, int64_t *result) {
+    int64_t *tree = calloc(nValues, sizeof(*tree));
+    size_t index, left = 0, right = 0, targetLeft, targetRight;
+    size_t topBit = 1, medianIndex;
+    int64_t donorCount = 0;
+
+    if (!tree) return -1;
+
+    while (topBit <= nValues / 2) topBit <<= 1;
+
+    for (index = 0; index < nBins; ++index) {
+        targetLeft = index > radius ? index - radius : 0;
+        targetRight = radius >= nBins - index - 1 ? nBins : index + radius + 1;
+
+        // reuse the counts as donors enter on the right and leave on the left
+        while (right < targetRight) {
+            if (donors[right]) {
+                ccFenwickUpdate(tree, nValues, (size_t)valueIndices[right], 1);
+                ++donorCount;
+            }
+            ++right;
+        }
+        while (left < targetLeft) {
+            if (donors[left]) {
+                ccFenwickUpdate(tree, nValues, (size_t)valueIndices[left], -1);
+                --donorCount;
+            }
+            ++left;
+        }
+
+        // keep each bin's count if there are no donors, and only raise it otherwise
+        result[index] = signal[index];
+        if (donorCount > 0) {
+            // take the larger middle value, e.g. [2, 4, 8, 10] gives 8
+            medianIndex = ccFenwickLowerBound(tree, nValues, donorCount / 2 + 1, topBit);
+            if (values[medianIndex] > result[index]) result[index] = values[medianIndex];
+        }
+    }
+
+    free(tree);
+    return 0;
+}

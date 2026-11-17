@@ -83,4 +83,5 @@ class EstimateWarning(_Message, RuntimeWarning):
         "flat": "Estimate has a flat maximum",
         "nonpositive": "Estimate has a nonpositive maximum",
         "fewFragments": "Insufficient paired fragments",
+        "fewBlocks": "Fewer eligible genomic blocks than requested",
     }

@@ -59,9 +59,9 @@ def testExceptionMessagesAndSerialization(errorType, builtinType, arguments, mes
 
 
 def testPythonAndCythonExceptions(tmp_path):
-    options = cc.LengthScaleOptions(blockWidthBP=200, bootstrapReplicates=2)
+    options = cc.LengthScaleOptions(blockWidthBP=300)
     with pytest.raises(cc.CountError, match="Counts must be"):
-        cc.estimateLengthScaleCounts([[[-1, 0]]], 100, options=options)
+        cc.estimateLengthScaleCounts([[[-1, 0, 0]]], 100, options=options)
     with pytest.raises(cc.CountError, match="Counts must be"):
         _native.musicBinomialLogTail(np.array([0]), np.array([1]))
     with pytest.raises(cc.InputError, match="Invalid output"):

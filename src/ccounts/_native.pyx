@@ -15,8 +15,9 @@ from .exceptions import (
 from pathlib import Path
 from time import perf_counter
 cimport numpy as cnp
-from libc.stdint cimport int64_t, uint64_t, uint16_t, uint32_t, uintptr_t
-from libc.math cimport log, log1p, fabs, fmax, isfinite
+from ._checks cimport _checkLogValues
+from libc.stdint cimport int64_t, uint64_t, uint16_t, uint32_t
+from libc.math cimport log, log1p, fabs, fmax
 from libc.stdlib cimport free
 from libc.string cimport memcpy
 
@@ -52,6 +53,7 @@ cnp.import_array()
 include "fragmentLength.pxi"
 include "pairedFragmentLength.pxi"
 include "lengthScale.pxi"
+include "mappabilityCorrection.pxi"
 
 cdef extern from "native/countsBackend.h":
     ctypedef struct ccSource:
@@ -423,47 +425,6 @@ cdef void _logLoop(const real_t *values, const real_t *reference, real_t *out,
                     out[i] = <real_t>(_logSum(x, pseudocount) - _logSum(r, pseudocount))
 
 
-cdef inline Py_ssize_t _checkLogValues(object values, object reference,
-    double pseudocount, object out) except -1:
-    cdef Py_ssize_t count
-    cdef size_t byteCount
-    cdef uintptr_t valuesAddress, outAddress, referenceAddress
-    if (
-        not isinstance(values, np.ndarray) or values.ndim not in (1, 2)
-        or values.dtype not in (np.dtype("float32"), np.dtype("float64"))
-        or not values.flags.c_contiguous
-    ):
-        raise InputError(kind="array")
-    if (
-        not isinstance(out, np.ndarray) or out.shape != values.shape
-        or out.dtype != values.dtype or not out.flags.c_contiguous
-        or not out.flags.writeable
-    ):
-        raise InputError(kind="output")
-    if not isfinite(pseudocount) or pseudocount <= 0:
-        raise NumericalError(kind="logDomain")
-    if reference is not None and (
-        not isinstance(reference, np.ndarray) or reference.shape != values.shape
-        or reference.dtype != values.dtype or not reference.flags.c_contiguous
-    ):
-        raise InputError(kind="array")
-    count = (<cnp.ndarray>values).size
-    byteCount = count * (sizeof(cnp.float32_t) if values.dtype == np.float32 else sizeof(cnp.float64_t))
-    valuesAddress = <uintptr_t>(<cnp.ndarray>values).data
-    outAddress = <uintptr_t>(<cnp.ndarray>out).data
-    if byteCount and valuesAddress != outAddress and (
-        valuesAddress < outAddress + byteCount and outAddress < valuesAddress + byteCount
-    ):
-        raise InputError(kind="overlap")
-    if reference is not None:
-        referenceAddress = <uintptr_t>(<cnp.ndarray>reference).data
-        if byteCount and referenceAddress != outAddress and (
-            referenceAddress < outAddress + byteCount and outAddress < referenceAddress + byteCount
-        ):
-            raise InputError(kind="overlap")
-    return count
-
-
 def logValues(values, reference, double pseudocount, out):
     cdef cnp.ndarray valuesArray
     cdef cnp.ndarray outArray
@@ -475,9 +436,9 @@ def logValues(values, reference, double pseudocount, out):
     outArray = out
     if reference is not None:
         referenceArray = reference
-        if values.dtype == np.float32: reference32 = <const cnp.float32_t *>referenceArray.data
+        if cnp.PyArray_TYPE(valuesArray) == cnp.NPY_FLOAT32: reference32 = <const cnp.float32_t *>referenceArray.data
         else: reference64 = <const cnp.float64_t *>referenceArray.data
-    if values.dtype == np.float32:
+    if cnp.PyArray_TYPE(valuesArray) == cnp.NPY_FLOAT32:
         with nogil:
             _logLoop(<const cnp.float32_t *>valuesArray.data, reference32, <cnp.float32_t *>outArray.data, count, pseudocount)
     else:
