@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ccounts"
-version = "0.3.0b2"
+version = "0.5.0b0"
 description = "Fast counting and processing for single-cell and bulk epigenomic sequencing data"
 requires-python = ">=3.10"
 license = "MIT"
