@@ -55,6 +55,20 @@ jobs:
           python -m pip install --upgrade pip build
           python -m build --sdist --outdir dist
 
+      - name: Check PyPI file sizes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          limitBytes = 100 * 1024 * 1024
+          for path in [*Path("dist").glob("*.whl"), *Path("dist").glob("*.tar.gz")]:
+              sizeBytes = path.stat().st_size
+              if sizeBytes > limitBytes:
+                  raise SystemExit(
+                      f"{path.name}: {sizeBytes / 1024**2:.2f} MiB exceeds PyPI's 100 MiB limit"
+                  )
+          PY
+
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:

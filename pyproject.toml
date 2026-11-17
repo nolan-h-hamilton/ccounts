@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ccounts"
-version = "0.3.0b0"
+version = "0.3.0b1"
 description = "Genomic bin counting and explicit depth normalization"
 requires-python = ">=3.10"
 license = "MIT"
