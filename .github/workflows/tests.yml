@@ -33,6 +33,10 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
+      - name: Set macOS build architecture
+        if: runner.os == 'macOS' && matrix.pythonVersion == '3.15'
+        run: echo "ARCHFLAGS=-arch $(uname -m)" >> "$GITHUB_ENV"
+
       - name: Install Linux build requirements
         if: runner.os == 'Linux'
         run: |
