@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ccounts"
 version = "0.3.0b2"
-description = "Genomic bin counting and explicit depth normalization"
+description = "Fast counting and processing for single-cell and bulk epigenomic sequencing data"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE", "HTSLIB_LICENSE.txt", "HTSCODECS_LICENSE.md", "ZLIB_LICENSE.txt"]
