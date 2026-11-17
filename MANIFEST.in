@@ -2,6 +2,7 @@ include LICENSE
 include HTSLIB_LICENSE.txt
 include HTSCODECS_LICENSE.md
 include ZLIB_LICENSE.txt
+include .github/scripts/installHDF5.sh
 recursive-include src/ccounts *.pyx *.pxd *.pxi *.h *.c
 recursive-include src/ccounts/data/gaps *.bed.gz *.json
 recursive-include src/ccounts/mappability *.npz *.json

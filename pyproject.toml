@@ -1,5 +1,11 @@
 [build-system]
-requires = ["setuptools>=77", "Cython>=3.1.8,<3.3", "numpy>=2.1", "scipy>=1.15"]
+requires = [
+    "setuptools>=77",
+    "Cython>=3.1.8,<3.3; python_version < '3.15'",
+    "Cython>=3.3.1,<3.4; python_version >= '3.15'",
+    "numpy>=2.1",
+    "scipy>=1.15",
+]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,7 +15,13 @@ description = "Genomic bin counting and explicit depth normalization"
 requires-python = ">=3.10"
 license = "MIT"
 license-files = ["LICENSE", "HTSLIB_LICENSE.txt", "HTSCODECS_LICENSE.md", "ZLIB_LICENSE.txt"]
-dependencies = ["numpy>=2.1", "scipy>=1.15", "anndata>=0.11", "h5py>=3.8"]
+dependencies = [
+    "numpy>=2.1",
+    "scipy>=1.15",
+    "anndata>=0.11; python_version < '3.15'",
+    "anndata>=0.13; python_version >= '3.15'",
+    "h5py>=3.8",
+]
 
 [project.optional-dependencies]
 test = ["pytest", "pysam>=0.23.3"]
@@ -40,7 +52,7 @@ target-version = ["py310"]
 force-exclude = "/(vendor|build)/"
 
 [tool.cibuildwheel]
-build = "cp310-* cp311-* cp312-* cp313-* cp314-*"
+build = "cp310-* cp311-* cp312-* cp313-* cp314-* cp315-*"
 test-extras = ["test"]
 test-command = [
     'python -I -c "import ccounts._native, ccounts._mappability, anndata, h5py, pysam, scipy"',
@@ -54,3 +66,10 @@ before-all = "dnf install -y zlib-devel"
 [[tool.cibuildwheel.overrides]]
 select = "*-musllinux*"
 before-all = "apk add --no-cache zlib-dev"
+
+[[tool.cibuildwheel.overrides]]
+select = "cp315-*"
+inherit.before-all = "append"
+before-all = "bash {project}/.github/scripts/installHDF5.sh"
+before-test = "python -m pip install --no-binary=h5py,numcodecs h5py==3.16.0 numcodecs==0.16.6"
+environment = { HDF5_DIR = "/tmp/ccountsHDF5" }

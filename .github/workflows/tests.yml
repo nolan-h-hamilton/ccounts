@@ -22,7 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, macos-15-intel]
-        pythonVersion: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        pythonVersion: ['3.10', '3.11', '3.12', '3.13', '3.14', '3.15']
     steps:
       - uses: actions/checkout@v4
 
@@ -39,10 +39,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev
 
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Build Python 3.15 dependencies
+        if: matrix.pythonVersion == '3.15'
+        env:
+          HDF5_DIR: /tmp/ccountsHDF5
+        run: |
+          bash .github/scripts/installHDF5.sh
+          python -m pip install --no-binary=h5py,numcodecs h5py==3.16.0 numcodecs==0.16.6
+
       - name: Install package and test dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install --only-binary=:all: ".[test]"
+          python -m pip install --only-binary=${{ matrix.pythonVersion == '3.15' && 'numpy,scipy,pandas,pysam' || ':all:' }} ".[test]"
 
       - name: Test installed package
         working-directory: ${{ runner.temp }}
