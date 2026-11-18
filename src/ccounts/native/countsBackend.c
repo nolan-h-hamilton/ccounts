@@ -508,6 +508,29 @@ static void ccConsume(ccWork *work, const ccEvent *event) {
     }
 }
 
+static int64_t ccBAMQueryPadding(const ccSource *source, int tid,
+                                 int64_t chromosomeLength, const ccOptions *options) {
+    int64_t padding = ccMax(
+        llabs(options->shiftForward5p), llabs(options->shiftReverse5p));
+    padding = ccMin(padding, chromosomeLength);
+
+    if (options->extendFrom5pBP >= chromosomeLength - padding)
+        return chromosomeLength;
+    padding += options->extendFrom5pBP;
+
+    if (options->bamInputMode == 1 && options->countMode != 4) {
+        int64_t templatePadding = options->maxTemplateLengthBP;
+        if (templatePadding <= 0)
+            templatePadding = source->maximumTemplateLengths[tid];
+        // An unknown template bound requires a full chromosome scan.
+        if (templatePadding < 0 || templatePadding >= chromosomeLength - padding)
+            return chromosomeLength;
+        padding += templatePadding;
+    }
+
+    return padding;
+}
+
 /**
  * @brief Read BAM/FRAGMENTS records and update counts or totals.
  *
@@ -532,8 +555,8 @@ static int ccVisit(ccSource *source, const char *chromosome, int64_t chromosomeL
                     int64_t start, int64_t end, const ccOptions *options,
                     ccWork *work, int owned, const char **error) {
     int tid, status, accepted, collectTemplateLengths;
-    int64_t queryStart = start, queryEnd = end, padding = 0, owner;
-    int64_t templatePadding, observedTemplateLength, maximumTemplateLength = 0;
+    int64_t queryStart = start, queryEnd = end, owner;
+    int64_t observedTemplateLength, maximumTemplateLength = 0;
     hts_itr_t *iterator = NULL;
     bam1_t *record = NULL;
     kstring_t line = {0, 0, NULL};
@@ -544,30 +567,7 @@ static int ccVisit(ccSource *source, const char *chromosome, int64_t chromosomeL
         if (tid < 0) return 0;
 
         if (!owned) {
-            padding = ccMax(
-                llabs(options->shiftForward5p), llabs(options->shiftReverse5p));
-            padding = ccMin(padding, chromosomeLength);
-
-            if (options->extendFrom5pBP >= chromosomeLength - padding)
-                padding = chromosomeLength;
-            else
-                padding += options->extendFrom5pBP;
-
-            if (options->bamInputMode == 1 && options->countMode != 4) {
-                templatePadding = options->maxTemplateLengthBP;
-
-                if (templatePadding <= 0) {
-                    templatePadding = source->maximumTemplateLengths[tid];
-                    // The first unbounded query scans the chromosome to learn its bound
-                    if (templatePadding < 0) templatePadding = chromosomeLength;
-                }
-
-                if (templatePadding >= chromosomeLength - padding)
-                    padding = chromosomeLength;
-                else
-                    padding += templatePadding;
-            }
-
+            int64_t padding = ccBAMQueryPadding(source, tid, chromosomeLength, options);
             queryStart = start > padding ? start - padding : 0;
             queryEnd = padding >= chromosomeLength - end
                 ? chromosomeLength
@@ -987,8 +987,8 @@ int ccRegionEndpointTotal(ccSource *source, const char *chromosome,
                           double *total, const char **error) {
     ccWork work = {0};
     int64_t start, end = 0;
-    size_t i;
-    int status;
+    int64_t maxGap = ccMin(chromosomeLength, 64 * 1024);
+    size_t i, first, stop;
 
     if (source->kind == 2 || options->countMode != 3)
         return ccFail(error, ccInvalidUnits);
@@ -1002,16 +1002,39 @@ int ccRegionEndpointTotal(ccSource *source, const char *chromosome,
             return ccFail(error, ccInvalidRegion);
     }
 
-    work.start = regions[0];
-    work.end = end;
-    work.options = options;
-    work.endpointRegions = regions;
-    work.endpointRegionCount = regionCount;
+    if (source->kind == 0 && regionCount > 1) {
+        int tid = sam_hdr_name2tid(source->header, chromosome);
+        if (tid < 0) {
+            *total = 0.0;
+            return 0;
+        }
+        int64_t padding = ccBAMQueryPadding(source, tid, chromosomeLength, options);
+        // group nearby intervals and any whose padded queries overlap
+        maxGap = padding >= (chromosomeLength - maxGap) / 2
+            ? chromosomeLength : maxGap + 2 * padding;
+    }
 
-    status = ccVisit(source, chromosome, chromosomeLength, work.start, work.end,
-                     options, &work, 0, error);
+    work.options = options;
+    for (first = 0; first < regionCount; first = stop) {
+        // we scan regions together to save calls, splitting at gaps over maxGap
+        for (stop = first + 1; stop < regionCount; ++stop) {
+            if (regions[2 * stop] - regions[2 * stop - 1] > maxGap) break;
+        }
+
+        work.start = regions[2 * first];
+        work.end = regions[2 * stop - 1];
+
+        // count endpoints in these regions, skipping the gaps
+        work.endpointRegions = regions + 2 * first;
+        work.endpointRegionCount = stop - first;
+
+        int status = ccVisit(source, chromosome, chromosomeLength, work.start, work.end,
+                             options, &work, 0, error);
+        if (status) return status;
+    }
+
     *total = work.endpointMass + work.endpointCorrection;
-    return status;
+    return 0;
 }
 
 static int ccCompareReadLengths(const void *first, const void *second) {

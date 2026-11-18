@@ -10,6 +10,7 @@ from functools import wraps
 from threading import RLock
 from time import perf_counter
 import gzip
+import logging
 import warnings
 
 import numpy as np
@@ -33,6 +34,7 @@ from .normalization import LibraryTotals
 from .fragmentLength import FragmentLengthOptions
 from .lengthScale import (
     LengthScaleOptions,
+    _defaultBinSizeBP,
     _estimateLengthScale,
     _lengthScaleExclusions,
 )
@@ -521,7 +523,7 @@ class Reader:
         bedGraphCounts=False,
         summaryFunction=np.mean,
     ):
-        r"""Estimate a length scale for enriched regions (based on MUSIC).
+        r"""Estimate a length scale for enriched regions
 
         * Detect enriched regions according to a local vs. background heuristic
           at multiple filter widths.
@@ -529,7 +531,7 @@ class Reader:
           it qualified as enriched.
         * Return the average of these maximal filter widths.
 
-        Confidence intervals use an infinitesimal jackknife (IJ) standard error
+        Confidence intervals use a fast infinitesimal jackknife (IJ) standard error
         from the genomic blocks and a normal approximation.
 
         References
@@ -544,12 +546,80 @@ class Reader:
             raise InputError()
         selected = selectedSamples(sampleIDs, self.sampleIDs)
 
-        binSize = (
-            self.grid.binSizeBP if options.binSizeBP is None else options.binSizeBP
+        logger = logging.getLogger("ccounts.lengthScale")
+        kinds = [self._info[sampleID]["sourceKind"] for sampleID in selected]
+        binned = [
+            f"{sampleID} ({kind})"
+            for sampleID, kind in zip(selected, kinds)
+            if kind not in ("BAM", "FRAGMENTS")
+        ]
+        gridBinSize = self.grid.binSizeBP
+        bedGraphNote = (
+            " bedGraph values are read as one count per bin, so %s must match "
+            "the bedGraph's interval width."
         )
+        if options.binSizeBP is not None:
+            binSize = options.binSizeBP
+            logger.info(
+                "Length scale estimation is using %d bp bins, as set by "
+                "LengthScaleOptions.binSizeBP. The Reader's grid "
+                "(GridSpec.binSizeBP=%d) isn't used for this estimate.%s",
+                binSize,
+                gridBinSize,
+                (
+                    bedGraphNote % "LengthScaleOptions.binSizeBP"
+                    if "BEDGRAPH" in kinds
+                    else ""
+                ),
+            )
+        elif not binned:
+            binSize = _defaultBinSizeBP
+            logger.info(
+                "Length scale estimation is using %d bp bins, the default when "
+                "LengthScaleOptions.binSizeBP is None and every source is BAM or "
+                "FRAGMENTS. The Reader's grid (GridSpec.binSizeBP=%d) isn't used "
+                "for this estimate.",
+                binSize,
+                gridBinSize,
+            )
+        else:
+            binSize = gridBinSize
+            listed = ", ".join(binned[:5])
+            if len(binned) > 5:
+                listed += f", and {len(binned) - 5} more"
+            notes = ""
+            if "H5AD" in kinds:
+                notes += " H5AD counts can't be used at any other bin size."
+            if "BEDGRAPH" in kinds:
+                notes += bedGraphNote % "GridSpec.binSizeBP"
+            if binSize == _defaultBinSizeBP:
+                logger.info(
+                    "Length scale estimation is using the Reader's %d bp bins "
+                    "(GridSpec.binSizeBP), because LengthScaleOptions.binSizeBP "
+                    "is None and these sources are already binned: %s. That is "
+                    "also the bin size it uses when every source is BAM or "
+                    "FRAGMENTS.%s",
+                    binSize,
+                    listed,
+                    notes,
+                )
+            else:
+                logger.warning(
+                    "Length scale estimation is using the Reader's %d bp bins "
+                    "(GridSpec.binSizeBP), not the %d bp it uses when every "
+                    "source is BAM or FRAGMENTS, because "
+                    "LengthScaleOptions.binSizeBP is None and these sources are "
+                    "already binned: %s.%s To confirm this bin size and silence "
+                    "this message, set LengthScaleOptions(binSizeBP=%d).",
+                    binSize,
+                    _defaultBinSizeBP,
+                    listed,
+                    notes,
+                    binSize,
+                )
         grid = GridSpec(self.grid.chromosomeSizes, binSize)
-        width = options.blockWidthBP
-        if width % binSize:
+        width = options.blockWidthBP - options.blockWidthBP % binSize
+        if not width:
             raise InputError(kind="region")
 
         assembly, exclusions = _lengthScaleExclusions(
@@ -560,16 +630,33 @@ class Reader:
         excluded = 0
         if explicit:
             chosen = []
+            moved = 0
             for chromosome, start, end in regions:
-                start, end = grid.checkRegion(chromosome, start, end)
-                if end - start != width or end % binSize:
+                if chromosome not in grid.chromosomeSizes:
+                    raise SourceError(kind="missing")
+                start = checkedInteger(start, "startBP")
+                end = checkedInteger(end, "endBP")
+                length = grid.chromosomeSizes[chromosome]
+                if end > length or end - start not in (width, options.blockWidthBP):
                     raise InputError(kind="region")
+                moved += bool(start % binSize)
+                start -= start % binSize
+                start, end = grid.checkRegion(chromosome, start, start + width)
                 intervals = exclusions.get(chromosome, ())
                 position = bisect_left(intervals, (end,))
                 if position > 0 and intervals[position - 1][1] > start:
                     raise InputError(kind="region")
                 chosen.append((chromosome, start, end))
             eligibleCount = len(chosen)
+            if moved:
+                logger.info(
+                    "Length scale estimation moved %d of %d region starts down "
+                    "to the nearest %d bp bin boundary. The regions actually "
+                    'used are in the result\'s settings["regions"].',
+                    moved,
+                    len(chosen),
+                    binSize,
+                )
         else:
             startRanges = []
             rangeEnds = []

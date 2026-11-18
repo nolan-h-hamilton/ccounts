@@ -191,6 +191,96 @@ def testNormalizationFromRegions(countSources, tmp_path, compressed, scaleTo):
             cc.Normalization.fromRegions(reader, empty)
 
 
+def testNormalizationFromSeparatedRegions(tmp_path):
+    chromosome = "chr1"
+    length = 2_600_000
+    grid = cc.GridSpec({chromosome: length}, binSizeBP=1)
+    bamPath = tmp_path / "separated.bam"
+    header = {
+        "HD": {"VN": "1.6", "SO": "coordinate"},
+        "SQ": [{"SN": chromosome, "LN": length}],
+    }
+    with pysam.AlignmentFile(bamPath, "wb", header=header) as handle:
+        for name, flag, start, mate, span in (
+            ("longPair", 99, 50, 799_941, 799_901),
+            ("gapRead", 0, 300_000, -1, 0),
+            ("longPair", 147, 799_941, 50, -799_901),
+            ("reverseRead", 16, 800_041, -1, 0),
+            ("distantRead", 0, 2_500_000, -1, 0),
+        ):
+            record = pysam.AlignedSegment()
+            record.query_name = name
+            record.query_sequence = "A" * 10
+            record.flag = flag
+            record.reference_id = 0
+            record.reference_start = start
+            record.mapping_quality = 60
+            record.cigar = [(0, 10)]
+            record.next_reference_id = 0 if mate >= 0 else -1
+            record.next_reference_start = mate
+            record.template_length = span
+            handle.write(record)
+    pysam.index(str(bamPath))
+
+    fragmentsPath = tmp_path / "separated.tsv.gz"
+    raw = tmp_path / "separated.tsv"
+    raw.write_text(
+        "chr1\t100\t800001\tA\t3\nchr1\t300000\t300010\tA\t11\n"
+        "chr1\t800001\t800002\tA\t2\n",
+        encoding="utf-8",
+    )
+    pysam.tabix_compress(str(raw), str(fragmentsPath))
+    pysam.tabix_index(str(fragmentsPath), preset="bed")
+
+    regions = ((99, 102), (800_000, 800_002), (2_500_050, 2_500_051))
+    bedRegions = (regions[1], (99, 101), (100, 102), regions[1], regions[2])
+    regionPath = tmp_path / "separated.bed"
+    regionPath.write_text(
+        "".join(f"{chromosome}\t{start}\t{end}\n" for start, end in bedRegions),
+        encoding="utf-8",
+    )
+
+    sources = [
+        cc.SourceSpec(
+            bamPath,
+            "BAM",
+            mode,
+            cc.CountOptions(
+                countMode="coverage",
+                bamInputMode=mode,
+                shiftForward5p=50,
+                shiftReverse5p=50,
+            ),
+        )
+        for mode in ("reads", "fragments")
+    ]
+    sources.append(
+        cc.SourceSpec(
+            fragmentsPath,
+            "FRAGMENTS",
+            "weighted",
+            cc.CountOptions(countMode="coverage", fragmentsUseReadSupport=True),
+        )
+    )
+    endpointSources = [
+        replace(source, countOptions=replace(source.countOptions, countMode="fiveprime"))
+        for source in sources
+    ]
+    with cc.openSources(endpointSources, grid, dtype="float64") as reader:
+        expected = np.column_stack(
+            [
+                reader.readRegion(chromosome, start, end).values.sum(axis=1)
+                for start, end in regions
+            ]
+        )
+    np.testing.assert_array_equal(expected, [[1, 1, 1], [1, 1, 0], [3, 7, 0]])
+    with cc.openSources(sources, grid, dtype="float64") as reader:
+        for _ in range(2):
+            norm = cc.Normalization.fromRegions(reader, regionPath, scaleTo=30)
+            masses = [record["regionEndpointMass"] for record in norm.records.values()]
+            np.testing.assert_array_equal(masses, expected.sum(axis=1))
+
+
 def testRPGCTerritory():
     grid = cc.GridSpec({"chr1": 100, "chr2": 200, "chr3": 300})
     record = {

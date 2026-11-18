@@ -95,6 +95,9 @@ def testFrozenDetectorAndIJ(caplog, summaryFunction, confidenceLevel):
     regions = [("chr1", start, start + 20000) for start in (1000, 0, 500, 100)]
     options = cc.LengthScaleOptions(
         blockWidthBP=20000,
+        scaleStartBP=None,
+        scaleFactor=1.5,
+        pValueWindowBP=1500,
         returnProfiles=True,
         confidenceLevel=confidenceLevel,
     )
@@ -323,7 +326,9 @@ def testReaderCentersAndOwnership(countSources, monkeypatch):
             return self.handle.countRegion(*args)
 
     options = cc.LengthScaleOptions(
+        binSizeBP=25,
         blockWidthBP=100,
+        scaleStartBP=None,
         filterType="mean",
         significanceLevel=0.99,
     )
@@ -426,12 +431,12 @@ def testReaderCentersAndOwnership(countSources, monkeypatch):
 
 
 @pytest.mark.parametrize("value", [2, 0.5, -1])
-def testBedGraphCountSemantics(tmp_path, value):
+def testBedGraphCountSemantics(tmp_path, value, caplog):
     path = tmp_path / "counts.bg"
     path.write_text(f"chr1\t0\t50\t{value}\n")
 
     indexed = cc.prepareIndex(path, "BEDGRAPH", targetPath=tmp_path / "counts.bg.gz")
-    options = cc.LengthScaleOptions(blockWidthBP=100)
+    options = cc.LengthScaleOptions(blockWidthBP=100, scaleStartBP=None)
 
     with cc.openSources(
         [cc.SourceSpec(indexed, "BEDGRAPH", "s")], cc.GridSpec({"chr1": 100}, 25)
@@ -440,10 +445,24 @@ def testBedGraphCountSemantics(tmp_path, value):
             reader.estimateLengthScale(options=options, excludeRanges={})
 
         if value == 2:
-            result = reader.estimateLengthScale(
-                options=options, bedGraphCounts=True, excludeRanges={}
-            )
+            caplog.clear()
+            with caplog.at_level(logging.INFO, logger="ccounts.lengthScale"):
+                result = reader.estimateLengthScale(
+                    options=options, bedGraphCounts=True, excludeRanges={}
+                )
 
+            assert result["settings"]["binSizeBP"] == 25
+            notices = [r for r in caplog.records if r.levelno == logging.WARNING]
+            assert len(notices) == 1
+            assert notices[0].getMessage() == (
+                "Length scale estimation is using the Reader's 25 bp bins "
+                "(GridSpec.binSizeBP), not the 150 bp it uses when every source is "
+                "BAM or FRAGMENTS, because LengthScaleOptions.binSizeBP is None "
+                "and these sources are already binned: s (BEDGRAPH). bedGraph "
+                "values are read as one count per bin, so GridSpec.binSizeBP must "
+                "match the bedGraph's interval width. To confirm this bin size and "
+                "silence this message, set LengthScaleOptions(binSizeBP=25)."
+            )
             assert result["sampleResults"][0]["totalEvents"] == 4
             assert (
                 result["settings"]["sourceInfo"]["s"]["eventUnit"] == "declaredBinCount"
@@ -456,7 +475,7 @@ def testBedGraphCountSemantics(tmp_path, value):
 
 
 @pytest.mark.parametrize("storage", ["dense", "csr", "csc"])
-def testH5ADCountsAndGrid(storage, tmp_path):
+def testH5ADCountsAndGrid(storage, tmp_path, caplog):
     data = Path(__file__).parent / "data"
     selection = {
         "barcodeColumn": "cellID",
@@ -470,11 +489,35 @@ def testH5ADCountsAndGrid(storage, tmp_path):
     with h5py.File(path, "r+") as handle:
         handle["var/end"][-1] = 150
     source = cc.SourceSpec(path, "H5AD", "s", selection=selection)
-    options = cc.LengthScaleOptions(blockWidthBP=150)
+    options = cc.LengthScaleOptions(blockWidthBP=150, scaleStartBP=None)
 
     with cc.openSources([source], cc.GridSpec({"chr1": 150}, 50)) as reader:
-        result = reader.estimateLengthScale(options=options, excludeRanges={})
+        with caplog.at_level(logging.INFO, logger="ccounts.lengthScale"):
+            result = reader.estimateLengthScale(options=options, excludeRanges={})
 
+        assert result["settings"]["binSizeBP"] == 50
+        notices = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(notices) == 1 and notices[0].name == "ccounts.lengthScale"
+        assert notices[0].getMessage() == (
+            "Length scale estimation is using the Reader's 50 bp bins "
+            "(GridSpec.binSizeBP), not the 150 bp it uses when every source is BAM "
+            "or FRAGMENTS, because LengthScaleOptions.binSizeBP is None and these "
+            "sources are already binned: s (H5AD). H5AD counts can't be used at "
+            "any other bin size. To confirm this bin size and silence this "
+            "message, set LengthScaleOptions(binSizeBP=50)."
+        )
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="ccounts.lengthScale"):
+            reader.estimateLengthScale(
+                options=replace(options, binSizeBP=50), excludeRanges={}
+            )
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert caplog.records[0].getMessage() == (
+            "Length scale estimation is using 50 bp bins, as set by "
+            "LengthScaleOptions.binSizeBP. The Reader's grid "
+            "(GridSpec.binSizeBP=50) isn't used for this estimate."
+        )
         assert result["sampleResults"][0]["totalEvents"] == 6
         assert result["settings"]["sourceInfo"]["s"]["eventUnit"] == "storedBinCount"
         assert (
@@ -526,7 +569,7 @@ def testReferenceMasksBeforeSampling(countSources, recwarn):
             (extras, 128),
             (None, options.blockCount),
         ):
-            sampledOptions = replace(options, blockCount=blockCount)
+            sampledOptions = replace(options, binSizeBP=25000, blockCount=blockCount)
             resolvedAssembly, exclusions = _lengthScaleExclusions(sizes, supplied)
             assert resolvedAssembly == "hg38"
             eligible = [
@@ -576,7 +619,9 @@ def testCustomMasksAndHalfOpenRegions(countSources, recwarn):
     from ccounts.lengthScale import _lengthScaleExclusions
 
     sizes = {"chr1": 115}
-    options = cc.LengthScaleOptions(blockCount=3, blockWidthBP=10, filterType="mean")
+    options = cc.LengthScaleOptions(
+        binSizeBP=2, blockCount=3, blockWidthBP=10, scaleStartBP=None, filterType="mean"
+    )
     exclusions = {"chr1": [(10, 20), (50, 51)]}
     source = cc.SourceSpec(countSources["events"], "FRAGMENTS", "s")
     with cc.openSources([source], cc.GridSpec(sizes, 2)) as reader:
@@ -639,48 +684,73 @@ def testCustomMasksAndHalfOpenRegions(countSources, recwarn):
 
 def testPhysicalFilterGrid():
     defaultWidths = [
-        300,
         500,
         700,
+        900,
         1100,
+        1300,
         1500,
-        2300,
-        3500,
-        5100,
-        7700,
+        1900,
+        2500,
+        3100,
+        3700,
+        4700,
+        5900,
+        7300,
+        9100,
         11500,
-        17300,
-        25900,
-        38900,
-        58500,
-        87700,
-        131500,
-        197100,
-        295700,
-        443500,
+        14300,
+        17900,
+        22300,
+        27900,
+        34700,
+        43500,
+        54300,
+        67900,
+        84700,
+        105900,
+        132300,
+        165500,
+        206900,
+        258500,
+        323100,
+        403900,
     ]
+    threeBinWidths = [300, 500, 700, 900, 1100, 1500]
     options = cc.LengthScaleOptions()
     assert options.scaleEndBP == options.blockWidthBP == 500000
+    assert (options.scaleStartBP, options.scaleFactor) == (500, 1.25)
+    assert options.pValueWindowBP == 2500
 
     for binSizeBP, fields, expected in (
         (100, {}, defaultWidths),
-        (100, {"scaleStartBP": 1, "scaleEndBP": 500000}, defaultWidths),
-        (100, {"scaleEndBP": 125000}, defaultWidths[:15]),
+        (100, {"scaleStartBP": 500, "scaleEndBP": 500000}, defaultWidths),
+        (100, {"scaleStartBP": 1, "scaleEndBP": 1500}, threeBinWidths),
+        (100, {"scaleStartBP": None, "scaleEndBP": 1500}, threeBinWidths),
+        (100, {"scaleEndBP": 125000}, defaultWidths[:25]),
         (100, {"scaleEndBP": 1000000}, defaultWidths),
         (
             100,
             {"blockWidthBP": 1000000, "scaleEndBP": None},
-            defaultWidths + [665100, 997700],
+            defaultWidths + [504900, 631100, 788900, 986100],
         ),
-        (100, {"scaleStartBP": 301, "scaleEndBP": 2500}, [500, 700, 1100, 1500, 2300]),
-        (100, {"scaleStartBP": 500, "scaleEndBP": 2500}, [500, 900, 1100, 1700]),
+        (
+            100,
+            {"scaleStartBP": 301, "scaleEndBP": 2500, "scaleFactor": 1.5},
+            [500, 700, 1100, 1500, 2300],
+        ),
+        (
+            100,
+            {"scaleStartBP": 500, "scaleEndBP": 2500, "scaleFactor": 1.5},
+            [500, 900, 1100, 1700],
+        ),
         (
             2000,
             {"scaleStartBP": 100000, "scaleEndBP": 250000, "scaleFactor": 1.25},
             [102000, 126000, 158000, 198000, 246000],
         ),
-        (41666, {"blockWidthBP": 416660}, [124998, 208330, 291662]),
-        (41667, {"blockWidthBP": 416670}, [125001, 208335, 291669]),
+        (41666, {"blockWidthBP": 416660}, [124998, 208330, 291662, 374994]),
+        (41667, {"blockWidthBP": 416670}, [125001, 208335, 291669, 375003]),
     ):
         configured = replace(options, **fields)
         counts = np.zeros((1, 1, configured.blockWidthBP // binSizeBP), dtype=np.int64)
@@ -701,7 +771,7 @@ def testPhysicalFilterGrid():
         )
 
     for binSizeBP, fields in (
-        (100, {"blockWidthBP": 200}),
+        (100, {"blockWidthBP": 200, "scaleStartBP": None}),
         (2000, {"scaleStartBP": 125000, "scaleEndBP": 125000}),
     ):
         configured = replace(options, **fields)
@@ -833,7 +903,7 @@ def testInvalidCountsOptionsAndRegions():
         {"blockWidthBP": 1000, "scaleStartBP": 1001, "scaleEndBP": None},
         {"confidenceLevel": 1},
         {"returnProfiles": 1},
-        {"binSizeBP": 100, "blockWidthBP": 150},
+        {"binSizeBP": 200, "blockWidthBP": 150, "scaleStartBP": None},
         {"filterType": "average"},
         {"filterType": "Mean"},
         {"filterType": " mean "},
@@ -883,3 +953,88 @@ def testInvalidCountsOptionsAndRegions():
     assert result["scaleBP"] == 0
     assert result["SEBP"] == 0
     np.testing.assert_array_equal(result["blockInfluenceBP"], [0.0, 0.0])
+
+
+def testDefaultBinSizeAndTrimmedBlocks(countSources, caplog):
+    assert cc.LengthScaleOptions().binSizeBP is None
+    assert cc.LengthScaleOptions(binSizeBP=150).blockWidthBP == 500000
+
+    options = cc.LengthScaleOptions(blockCount=2, blockWidthBP=500, scaleStartBP=None)
+    source = cc.SourceSpec(countSources["events"], "FRAGMENTS", "s")
+    with cc.openSources([source], cc.GridSpec({"chr1": 1200}, 25)) as reader:
+        with caplog.at_level(logging.INFO, logger="ccounts.lengthScale"):
+            result = reader.estimateLengthScale(options=options, excludeRanges={})
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert caplog.records[0].getMessage() == (
+            "Length scale estimation is using 150 bp bins, the default when "
+            "LengthScaleOptions.binSizeBP is None and every source is BAM or "
+            "FRAGMENTS. The Reader's grid (GridSpec.binSizeBP=25) isn't used for "
+            "this estimate."
+        )
+        settings = result["settings"]
+        assert settings["binSizeBP"] == 150
+        assert settings["blockWidthBP"] == 450
+        assert settings["filterWidthsBP"] == [450]
+        assert settings["sampling"]["eligibleBlockCount"] == 6
+        assert len(settings["regions"]) == 2
+        assert all(
+            start % 150 == 0 and end - start == 450
+            for _, start, end in settings["regions"]
+        )
+        assert result["sampleResults"][0]["analyzedBP"] == 2 * 450
+
+        for width in (500, 450):
+            explicit = reader.estimateLengthScale(
+                options=options, regions=[("chr1", 150, 150 + width)], excludeRanges={}
+            )
+            assert explicit["settings"]["regions"] == [["chr1", 150, 600]]
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="ccounts.lengthScale"):
+            moved = reader.estimateLengthScale(
+                options=options,
+                regions=[("chr1", 100, 600), ("chr1", 200, 650), ("chr1", 600, 1100)],
+                excludeRanges={},
+            )
+        assert moved["settings"]["regions"] == [
+            ["chr1", 0, 450],
+            ["chr1", 150, 600],
+            ["chr1", 600, 1050],
+        ]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert caplog.records[1].getMessage() == (
+            "Length scale estimation moved 2 of 3 region starts down to the "
+            "nearest 150 bp bin boundary. The regions actually used are in the "
+            'result\'s settings["regions"].'
+        )
+
+        for region in (("chr1", 150, 560), ("chr1", 750, 1250)):
+            with pytest.raises(cc.InputError):
+                reader.estimateLengthScale(
+                    options=options, regions=[region], excludeRanges={}
+                )
+        with pytest.raises(cc.SourceError):
+            reader.estimateLengthScale(
+                options=options, regions=[("chr2", 0, 500)], excludeRanges={}
+            )
+
+        gridBin = reader.estimateLengthScale(
+            options=replace(options, binSizeBP=25), excludeRanges={}
+        )
+        assert gridBin["settings"]["binSizeBP"] == 25
+        assert gridBin["settings"]["blockWidthBP"] == 500
+
+        with pytest.raises(cc.InputError):
+            reader.estimateLengthScale(
+                options=replace(options, blockWidthBP=100), excludeRanges={}
+            )
+
+    counts = np.zeros((1, 1, 3), dtype=np.int64)
+    for width in (500, 450):
+        trimmed = cc.estimateLengthScaleCounts(
+            counts, 150, options=options, regions=[("chr1", 0, width)]
+        )
+        assert trimmed["settings"]["blockWidthBP"] == 450
+        assert trimmed["settings"]["regions"] == [["chr1", 0, 450]]
+        assert trimmed["sampleResults"][0]["analyzedBP"] == 450
+    with pytest.raises(cc.InputError):
+        cc.estimateLengthScaleCounts(np.zeros((1, 1, 4)), 150, options=options)

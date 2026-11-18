@@ -17,6 +17,8 @@ from .exceptions import (
 )
 from .genomes import assemblyBlacklistRanges, assemblyChromosomeSizes
 
+_defaultBinSizeBP = 150
+
 
 @dataclass(frozen=True)
 class LengthScaleOptions:
@@ -25,11 +27,15 @@ class LengthScaleOptions:
     Attributes
     ----------
     binSizeBP : int or None
-        Number of base pairs comprising each genomic bin
+        Bin size in bp used for length scale estimation. This parameter only controls
+        bin sizes for length scale estimation and not necessarily the Reader's.
+        `None` uses 150 bp when every selected source holds reads
+        or fragments (BAM, FRAGMENTS), and the Reader's bin size when a source
+        holds binned counts (H5AD, BEDGRAPH).
     blockCount : int
         Maximum number of genomic blocks sampled by the Reader. Ignored if specific regions are given.
     blockWidthBP : int
-        Genomic block width in bp
+        Genomic block width in bp, rounded down to a whole number of bins.
     scaleStartBP : int or None
         Smallest nominal filter width in bp, with a minimum of three bins.
         None uses three bins.
@@ -60,13 +66,13 @@ class LengthScaleOptions:
     blockCount: int = 1024
     blockWidthBP: int = 500000
 
-    scaleStartBP: int | None = None
+    scaleStartBP: int | None = 500
     scaleEndBP: int | None = None
-    scaleFactor: float = 1.5
+    scaleFactor: float = 1.25
 
     smoothingRatio: float = 4.0
     significanceLevel: float = 0.05
-    pValueWindowBP: int = 1500
+    pValueWindowBP: int = 2500
     backgroundWindowBP: int | None = None
 
     confidenceLevel: float = 0.95
@@ -128,7 +134,7 @@ class LengthScaleOptions:
         if self.scaleStartBP is not None and self.scaleStartBP > self.scaleEndBP:
             raise InputError()
         if self.binSizeBP is not None and (
-            self.blockWidthBP % self.binSizeBP
+            self.blockWidthBP < self.binSizeBP
             or self.backgroundWindowBP < self.binSizeBP
         ):
             raise InputError(kind="grid")
@@ -207,8 +213,9 @@ def _lengthScaleRequest(blockCount, binSizeBP, sampleIDs, options, regions):
     binSizeBP = checkedInteger(binSizeBP, "binSizeBP", 1)
     if options.binSizeBP is not None and options.binSizeBP != binSizeBP:
         raise InputError(kind="grid")
-    if options.blockWidthBP % binSizeBP or options.backgroundWindowBP < binSizeBP:
+    if options.blockWidthBP < binSizeBP or options.backgroundWindowBP < binSizeBP:
         raise InputError(kind="grid")
+    width = options.blockWidthBP - options.blockWidthBP % binSizeBP
 
     sampleIDs = tuple(sampleIDs)
     if (
@@ -230,10 +237,10 @@ def _lengthScaleRequest(blockCount, binSizeBP, sampleIDs, options, regions):
                 not isinstance(chromosome, str)
                 or not chromosome
                 or start % binSizeBP
-                or end - start != options.blockWidthBP
+                or end - start not in (width, options.blockWidthBP)
             ):
                 raise InputError(kind="region")
-            checked.append([chromosome, start, end])
+            checked.append([chromosome, start, start + width])
 
         regions = checked
 
@@ -492,6 +499,7 @@ def _estimateLengthScale(
     )
     nSamples = len(sampleIDs)
     nBins = options.blockWidthBP // binSizeBP
+    blockWidth = nBins * binSizeBP
     criticalValue = float(norm.isf((1 - options.confidenceLevel) / 2))
     if smoothingCounts is not None:
         smoothingCounts = np.asarray(smoothingCounts)
@@ -502,7 +510,7 @@ def _estimateLengthScale(
         3 * binSizeBP,
         0 if options.scaleStartBP is None else options.scaleStartBP,
     )
-    maximumWidth = min(options.scaleEndBP, options.blockWidthBP)
+    maximumWidth = min(options.scaleEndBP, blockWidth)
     if scaleStart > maximumWidth:
         raise InputError()
 
@@ -527,6 +535,7 @@ def _estimateLengthScale(
         summaryFunction="mean" if summaryFunction is np.mean else "custom",
         CIMethod="IJNormal",
         binSizeBP=binSizeBP,
+        blockWidthBP=blockWidth,
         scaleStartBP=scaleStart,
         sampledBlockCount=blockCount,
         sampleIDs=list(sampleIDs),
@@ -618,7 +627,7 @@ def _estimateLengthScale(
             scaleBP=point,
             status="estimated" if defined[sample] else "noSignificantSSERs",
             totalEvents=totals[sample],
-            analyzedBP=blockCount * options.blockWidthBP,
+            analyzedBP=blockCount * blockWidth,
             coveredBP=supported * binSizeBP,
             coveredFraction=supported / (blockCount * nBins),
             supportedBinCount=supported,
