@@ -1,5 +1,5 @@
 from libc.math cimport lgamma
-from libc.stdint cimport intptr_t
+from libc.stdint cimport intptr_t, INT64_MAX
 from scipy.special.cython_special cimport betainc
 
 cdef extern from "native/fenwickMedian.h":

@@ -3,7 +3,6 @@ import numpy as np
 from .exceptions import (
     AllocationError,
     CountError,
-    EstimateError,
     EstimateWarning,
     InputError,
     NativeError,
@@ -15,11 +14,10 @@ from .exceptions import (
 from pathlib import Path
 from time import perf_counter
 cimport numpy as cnp
+from cpython.pyport cimport PY_SSIZE_T_MAX
 from ._checks cimport _checkLogValues
 from libc.stdint cimport int64_t, uint64_t, uint16_t, uint32_t
 from libc.math cimport log, log1p, fabs, fmax
-from libc.stdlib cimport free
-from libc.string cimport memcpy
 
 # numeric codes passed to countsBackend
 cdef enum:
@@ -49,7 +47,6 @@ cdef const double minNormalDouble = 2.2250738585072014e-308
 
 cnp.import_array()
 
-include "fragmentLength.pxi"
 include "pairedFragmentLength.pxi"
 include "lengthScale.pxi"
 include "mappabilityCorrection.pxi"
@@ -87,20 +84,8 @@ cdef extern from "native/countsBackend.h":
     int ccReadLength(ccSource *, const ccOptions *, uint32_t *, const char **) nogil
     int ccSourceRange(ccSource *, const char *, uint64_t, uint16_t, uint64_t *, uint64_t *, const char **) nogil
     int ccChromRange(ccSource *, const char *, int64_t, const ccOptions *, int64_t *, int64_t *, const char **) nogil
-    ctypedef struct ccEndpointCounts:
-        uint64_t queriedRecords
-        uint64_t excludedFlags
-        uint64_t excludedMappingQuality
-        uint64_t excludedSelection
-        uint64_t outsideEndpointOwnership
-        uint64_t preDedupForwardRecords
-        uint64_t preDedupReverseRecords
-        uint64_t removedForwardCoordinateDuplicates
-        uint64_t removedReverseCoordinateDuplicates
-        uint64_t retainedForwardEndpoints
-        uint64_t retainedReverseEndpoints
-    int ccBlockEndpoints(ccSource *, const char *, int64_t, int64_t, const ccOptions *,
-                         int64_t **, int64_t **, size_t *, size_t *, ccEndpointCounts *, const char **) nogil
+    int ccChromosomeCorrelations(ccSource *, const char *, const ccOptions *, size_t,
+                                 double *, uint64_t *, const char **) nogil
     int ccBuildIndex(const char *, int, const char *, int, const char **) nogil
 
 cdef int _kind(str kind) except -1:
@@ -318,50 +303,30 @@ cdef class NativeSource:
         _raise(status, error)
         return int(start), int(end)
 
-    def blockEndpoints(self, chromosome, int64_t start, int64_t end, options):
+    def chromosomeCorrelations(self, chromosome, options, Py_ssize_t maxLengthBP):
         cdef bytes name = chromosome.encode("utf-8")
         cdef const char *namePointer = name
         cdef ccOptions parsed = _options(options)
-        cdef ccEndpointCounts counts
+        cdef uint64_t readCounts[2]
         cdef int status
         cdef const char *error = NULL
-        cdef int64_t *forward = NULL
-        cdef int64_t *reverse = NULL
-        cdef size_t nF = 0, nR = 0
-        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] forwardArray, reverseArray
+        cdef cnp.ndarray[cnp.float64_t, ndim=1, mode="c"] curve
         self._checkOpen()
-        if chromosome not in self.chromosomeSizes or start < 0 or end <= start or end > self.chromosomeSizes[chromosome]:
-            raise InputError(kind="region")
+        if maxLengthBP <= 0 or maxLengthBP == PY_SSIZE_T_MAX:
+            raise InputError(kind="option", context="maxLengthBP")
+        curve = np.empty(maxLengthBP + 1, dtype=np.float64)
         with nogil:
-            status = ccBlockEndpoints(self._source, namePointer, start, end, &parsed,
-                                       &forward, &reverse, &nF, &nR, &counts, &error)
-        try:
-            _raise(status, error)
-            forwardArray = np.empty(nF, dtype=np.int64)
-            reverseArray = np.empty(nR, dtype=np.int64)
-            with nogil:
-                if nF:
-                    memcpy(<void *>forwardArray.data, forward, nF * sizeof(int64_t))
-                if nR:
-                    memcpy(<void *>reverseArray.data, reverse, nR * sizeof(int64_t))
-        finally:
-            free(forward)
-            free(reverse)
-        return forwardArray, reverseArray, {
-            "queriedRecords": int(counts.queriedRecords),
-            "excludedFlags": int(counts.excludedFlags),
-            "excludedMappingQuality": int(counts.excludedMappingQuality),
-            "excludedSelection": int(counts.excludedSelection),
-            "outsideEndpointOwnership": int(counts.outsideEndpointOwnership),
-            "preDedupForwardRecords": int(counts.preDedupForwardRecords),
-            "preDedupReverseRecords": int(counts.preDedupReverseRecords),
-            "removedForwardCoordinateDuplicates": int(counts.removedForwardCoordinateDuplicates),
-            "removedReverseCoordinateDuplicates": int(counts.removedReverseCoordinateDuplicates),
-            "retainedForwardEndpoints": int(counts.retainedForwardEndpoints),
-            "retainedReverseEndpoints": int(counts.retainedReverseEndpoints)}
+            status = ccChromosomeCorrelations(
+                self._source, namePointer, &parsed, maxLengthBP,
+                <double *>curve.data, readCounts, &error)
+        _raise(status, error)
+        return curve, readCounts[0], readCounts[1]
 
-    def estimateFragmentLength(self, options, fragmentLengthOptions):
+    def estimateFragmentLength(self, options, fragmentLengthOptions, int singleEndThreads=1):
         cdef ccOptions parsed = _options(options)
+
+        cdef NativeSource scanSource = self
+
         self._checkOpen()
         if self.sourceKind != "BAM":
             raise SourceError()
@@ -371,14 +336,24 @@ cdef class NativeSource:
                 self.path, self._threads, parsed.flagExclude,
                 parsed.minMappingQuality, parsed.minTemplateLengthBP, parsed.maxTemplateLengthBP,
                 self._barcodeAllowListFile, self._barcodeTag)
-            result.update({"method": "pairedTemplateMedian", "CILowerBP": None,
-                           "CIUpperBP": None, "bootstrapStdBP": None, "warnings": [],
+            result.update({"method": "pairedTemplateMedian", "warnings": [],
                            "runtimeSeconds": perf_counter() - started})
             if result["status"] == "insufficientData":
                 result["warnings"].append(EstimateWarning.variants["fewFragments"])
             return result
         from .fragmentLength import _estimateSingleEnd
-        return _estimateSingleEnd(self, options, fragmentLengthOptions)
+        if singleEndThreads > self._threads:
+            scanSource = NativeSource(
+                self.path, self.sourceKind, self._sizes,
+                barcodeAllowListFile=self._barcodeAllowListFile,
+                barcodeTag=self._barcodeTag, threads=singleEndThreads)
+        try:
+            result = _estimateSingleEnd(scanSource, options, fragmentLengthOptions)
+            result["settings"]["threads"] = scanSource._threads
+            return result
+        finally:
+            if scanSource is not self:
+                scanSource.close()
 
 
 def checkIndex(path, sourceKind, *, threads=1):

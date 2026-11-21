@@ -11,6 +11,7 @@ from threading import RLock
 from time import perf_counter
 import gzip
 import logging
+import os
 import warnings
 
 import numpy as np
@@ -268,6 +269,27 @@ class _H5ADSource:
         return total
 
 
+def _cpuBudget():
+    try:
+        if hasattr(os, "process_cpu_count"):
+            budget = os.process_cpu_count()
+        elif hasattr(os, "sched_getaffinity"):
+            budget = len(os.sched_getaffinity(0))
+        else:
+            budget = os.cpu_count()
+    except OSError:
+        budget = None
+
+    allocation = os.environ.get("SLURM_CPUS_PER_TASK")
+    if allocation is None:
+        return budget
+    try:
+        allocated = int(allocation)
+    except ValueError:
+        return None
+    return min(budget, allocated) if budget is not None else allocated
+
+
 class Reader:
     def __init__(
         self, sources, grid, *, threads=1, dtype="float32", fragmentLengthOptions=None
@@ -286,7 +308,14 @@ class Reader:
         if len(self.sampleIDs) != len(self.sources):
             raise InputError(kind="identifiers")
         self.grid = grid
-        self.threads = checkedInteger(threads, "threads", 1, 65535)
+        autoThreads = isinstance(threads, str) and threads == "auto"
+        self.threads = 1 if autoThreads else checkedInteger(threads, "threads", 1, 65535)
+        self._singleEndThreads = self.threads
+        if autoThreads:
+            bamCount = sum(source.sourceKind == "BAM" for source in self.sources)
+            if bamCount:
+                cpusPerBAM = (_cpuBudget() or 0) // bamCount
+                self._singleEndThreads = max(1, min(4, cpusPerBAM - 2))
         self.dtype = np.dtype(dtype)
         if self.dtype not in (np.dtype("float32"), np.dtype("float64")):
             raise InputError(kind="array")
@@ -342,8 +371,14 @@ class Reader:
                             "".join(f"{barcode}\n" for barcode in sorted(selected))
                         )
 
+                    path = source.path
+                    if (
+                        source.sourceKind == "BAM"
+                        and self._singleEndThreads > self.threads
+                    ):
+                        path = Path(path).absolute()
                     handle = _native.NativeSource(
-                        source.path,
+                        path,
                         source.sourceKind,
                         dict(grid.chromosomeSizes),
                         barcodeAllowListFile=allowPath,
@@ -378,7 +413,9 @@ class Reader:
                         )
                         if options.inferFragmentLength:
                             diagnostics = handle.estimateFragmentLength(
-                                options, self.fragmentLengthOptions
+                                options,
+                                self.fragmentLengthOptions,
+                                self._singleEndThreads,
                             )
                             length = int(diagnostics["estimateBP"])
                             info["fragmentLengthDiagnostics"] = diagnostics
@@ -496,7 +533,7 @@ class Reader:
         info = self._info[sampleID]
         if info["fragmentLengthBP"] is None:
             diagnostics = self._handles[sampleID].estimateFragmentLength(
-                info["countOptions"], self.fragmentLengthOptions
+                info["countOptions"], self.fragmentLengthOptions, self._singleEndThreads
             )
             value = int(diagnostics["estimateBP"])
             info["fragmentLengthDiagnostics"] = diagnostics

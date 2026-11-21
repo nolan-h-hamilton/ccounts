@@ -1494,153 +1494,182 @@ int ccChromRange(ccSource *source, const char *chromosome, int64_t chromosomeLen
     return status;
 }
 
+typedef struct {
+    uint32_t position;
+    uint32_t count;
+} ccEndpointRun;
+
+typedef struct {
+    ccEndpointRun *runs;
+    size_t size;
+    size_t capacity;
+    int unordered;
+} ccEndpointRuns;
+
 static int ccEndpointCompare(const void *left, const void *right) {
-    int64_t a = *(const int64_t *)left;
-    int64_t b = *(const int64_t *)right;
+    uint32_t a = ((const ccEndpointRun *)left)->position;
+    uint32_t b = ((const ccEndpointRun *)right)->position;
 
     return (a > b) - (a < b);
 }
 
-int ccBlockEndpoints(ccSource *source, const char *chromosome, int64_t start,
-                     int64_t end, const ccOptions *options, int64_t **forward,
-                     int64_t **reverse, size_t *nF, size_t *nR,
-                     ccEndpointCounts *counts, const char **error) {
-    int tid, status, accepted, strand;
-    int64_t position;
-    int64_t *endpoints[2] = {NULL, NULL};
-    int64_t *grown;
-    size_t capacity[2] = {0, 0}, count[2] = {0, 0};
-    size_t nextCapacity, i, uniqueCount;
-    bam1_t *record;
-    hts_itr_t *iterator;
+static int ccAppendEndpoint(ccEndpointRuns *strand, uint32_t position, const char **error) {
+    size_t size = strand->size;
+    ccEndpointRun *runs = strand->runs;
+    if (size && position == runs[size - 1].position) {
+        if (runs[size - 1].count == UINT32_MAX) return ccFail(error, ccInvalidNumerics);
+        ++runs[size - 1].count;
+        return 0;
+    }
+    if (size && position < runs[size - 1].position) strand->unordered = 1;
 
-    *forward = NULL;
-    *reverse = NULL;
-    *nF = 0;
-    *nR = 0;
-    memset(counts, 0, sizeof(*counts));
+    if (size == strand->capacity) {
+        if (size > SIZE_MAX / sizeof(*runs) / 2) return ccFail(error, ccAllocationFailed);
+        size_t capacity = size ? size * 2 : 1024;
+        runs = realloc(runs, capacity * sizeof(*runs));
+        if (!runs) return ccFail(error, ccAllocationFailed);
+        strand->runs = runs;
+        strand->capacity = capacity;
+    }
+    runs[size].position = position;
+    runs[size].count = 1;
+    strand->size = size + 1;
+    return 0;
+}
 
+static int ccSortEndpoints(ccEndpointRuns *strand) {
+    if (!strand->unordered) return 0;
+
+    ccEndpointRun *runs = strand->runs;
+    qsort(runs, strand->size, sizeof(*runs), ccEndpointCompare);
+    size_t unique = 1;
+    for (size_t i = 1; i < strand->size; ++i) {
+        if (runs[i].position == runs[unique - 1].position) {
+            if (UINT32_MAX - runs[unique - 1].count < runs[i].count) return -1;
+            runs[unique - 1].count += runs[i].count;
+        } else {
+            runs[unique++] = runs[i];
+        }
+    }
+    strand->size = unique;
+    return 0;
+}
+
+static void ccCorrelateEndpoints(const ccEndpointRuns *forward, const ccEndpointRuns *reverse,
+                                 uint64_t dimension, size_t maxLag, double *curve) {
+    const ccEndpointRun *f = forward->runs, *r = reverse->runs;
+    size_t reverseStart = 0, forwardEnd = forward->size;
+    double sumF = 0.0, sumR = 0.0, squareF = 0.0, squareR = 0.0;
+
+    for (size_t i = 0; i < forward->size; ++i) {
+        uint32_t position = f[i].position;
+        double count = f[i].count;
+        sumF += count;
+        squareF += count * count;
+        while (reverseStart < reverse->size && r[reverseStart].position < position)
+            ++reverseStart;
+
+        for (size_t j = reverseStart; j < reverse->size; ++j) {
+            uint32_t lag = r[j].position - position;
+            if (lag > maxLag) break;
+            curve[lag] += count * r[j].count;
+        }
+    }
+
+    for (size_t j = 0; j < reverse->size; ++j) {
+        double count = r[j].count;
+        sumR += count;
+        squareR += count * count;
+    }
+
+    // Trim the margins at each lag to compute Pearson correlation on the overlap.
+    reverseStart = 0;
+    for (size_t lag = 0; lag <= maxLag; ++lag) {
+        uint64_t overlap = dimension - lag;
+        while (forwardEnd && f[forwardEnd - 1].position >= overlap) {
+            double count = f[--forwardEnd].count;
+            sumF -= count;
+            squareF -= count * count;
+        }
+        while (reverseStart < reverse->size && r[reverseStart].position < lag) {
+            double count = r[reverseStart++].count;
+            sumR -= count;
+            squareR -= count * count;
+        }
+
+        double varianceF = squareF - sumF * sumF / overlap;
+        double varianceR = squareR - sumR * sumR / overlap;
+        curve[lag] = varianceF > 0.0 && varianceR > 0.0
+            ? (curve[lag] - sumF * sumR / overlap) / sqrt(varianceF * varianceR)
+            : 0.0;
+    }
+}
+
+int ccChromosomeCorrelations(ccSource *source, const char *chromosome,
+                             const ccOptions *options, size_t maxLag,
+                             double *curve, uint64_t *readCounts, const char **error) {
     if (source->kind != 0) return ccFail(error, ccInvalidSource);
 
-    tid = sam_hdr_name2tid(source->header, chromosome);
+    int tid = sam_hdr_name2tid(source->header, chromosome);
     if (tid < 0) return ccFail(error, ccMissingSource);
-    if (start < 0 || end <= start || end > sam_hdr_tid2len(source->header, tid))
-        return ccFail(error, ccInvalidRegion);
+    hts_pos_t length = sam_hdr_tid2len(source->header, tid);
+    if (length <= 0 || length > UINT32_MAX) return ccFail(error, ccInvalidRegion);
 
-    iterator = sam_itr_queryi(source->index, tid, start, end);
+    memset(curve, 0, (maxLag + 1) * sizeof(*curve));
+    readCounts[0] = 0;
+    readCounts[1] = 0;
+    if (source->selection->active && !source->selection->count) return 0;
+
+    hts_itr_t *iterator = sam_itr_queryi(source->index, tid, 0, length);
     if (!iterator) return ccFail(error, ccInputQueryFailed);
-
-    record = bam_init1();
+    bam1_t *record = bam_init1();
     if (!record) {
         hts_itr_destroy(iterator);
         return ccFail(error, ccAllocationFailed);
     }
 
+    ccEndpointRuns strands[2] = {0};
+    int status;
     while ((status = sam_itr_next(source->file, iterator, record)) >= 0) {
-        ++counts->queriedRecords;
-        if ((record->core.flag & (options->flagExclude | BAM_FUNMAP)) ||
-            record->core.tid < 0) {
-            ++counts->excludedFlags;
-            continue;
-        }
-
-        if (record->core.qual < options->minMappingQuality) {
-            ++counts->excludedMappingQuality;
-            continue;
-        }
-
-        accepted = ccBasicRecord(source, record, options, error);
+        int accepted = ccBasicRecord(source, record, options, error);
+        if (accepted == 0) continue;
         if (accepted < 0) {
             status = -2;
             break;
         }
 
-        if (!accepted) {
-            ++counts->excludedSelection;
-            continue;
-        }
-
-        strand = (record->core.flag & BAM_FREVERSE) != 0;
-        if (strand) {
-            if (bam_cigar2rlen(
-                    record->core.n_cigar, bam_get_cigar(record)) <= 0) {
-                ccFail(error, ccInvalidFile);
-                status = -2;
-                break;
-            }
-
-            position = bam_endpos(record);
-            if (position <= start || position > end) {
-                ++counts->outsideEndpointOwnership;
-                continue;
-            }
+        int reverse = (record->core.flag & BAM_FREVERSE) != 0;
+        hts_pos_t position = record->core.pos;
+        // The conceptual chromosome vector includes the right endpoint at length.
+        if (reverse) {
+            position += bam_cigar2rlen(record->core.n_cigar, bam_get_cigar(record));
+            position = ccMin(position, length);
         } else {
-            position = record->core.pos;
-            if (position < start || position >= end) {
-                ++counts->outsideEndpointOwnership;
-                continue;
-            }
+            position = ccMax(position, 0);
         }
-
-        if (count[strand] == capacity[strand]) {
-            if (capacity[strand] > SIZE_MAX / sizeof(int64_t) / 2) {
-                ccFail(error, ccInvalidNumerics);
-                status = -2;
-                break;
-            }
-
-            nextCapacity = capacity[strand] ? capacity[strand] * 2 : 1024;
-            grown = realloc(endpoints[strand], nextCapacity * sizeof(int64_t));
-            if (!grown) {
-                ccFail(error, ccAllocationFailed);
-                status = -2;
-                break;
-            }
-
-            endpoints[strand] = grown;
-            capacity[strand] = nextCapacity;
+        if (ccAppendEndpoint(&strands[reverse], (uint32_t)position, error) != 0) {
+            status = -2;
+            break;
         }
-
-        endpoints[strand][count[strand]++] = position - start;
+        ++readCounts[reverse];
     }
 
     bam_destroy1(record);
     hts_itr_destroy(iterator);
-
-    if (status < -1) {
-        free(endpoints[0]);
-        free(endpoints[1]);
-        return *error ? -1 : ccFail(error, ccInputReadFailed);
-    }
-
-    counts->preDedupForwardRecords = count[0];
-    counts->preDedupReverseRecords = count[1];
-
-    for (strand = 0; strand < 2; ++strand) {
-        if (count[strand] > 1)
-            qsort(endpoints[strand], count[strand], sizeof(int64_t), ccEndpointCompare);
-
-        uniqueCount = 0;
-        for (i = 0; i < count[strand]; ++i) {
-            if (i == 0 || endpoints[strand][i] != endpoints[strand][i - 1])
-                endpoints[strand][uniqueCount++] = endpoints[strand][i];
+    if (status == -1 && readCounts[0] && readCounts[1]) {
+        if (ccSortEndpoints(&strands[0]) != 0 || ccSortEndpoints(&strands[1]) != 0) {
+            ccFail(error, ccInvalidNumerics);
+            status = -2;
+        } else {
+            size_t usableLag = maxLag < (uint64_t)length ? maxLag : (size_t)length - 1;
+            ccCorrelateEndpoints(&strands[0], &strands[1], (uint64_t)length + 1,
+                                 usableLag, curve);
         }
-
-        count[strand] = uniqueCount;
     }
+    free(strands[0].runs);
+    free(strands[1].runs);
 
-    counts->retainedForwardEndpoints = count[0];
-    counts->retainedReverseEndpoints = count[1];
-    counts->removedForwardCoordinateDuplicates =
-        counts->preDedupForwardRecords - count[0];
-    counts->removedReverseCoordinateDuplicates =
-        counts->preDedupReverseRecords - count[1];
-
-    *forward = endpoints[0];
-    *reverse = endpoints[1];
-    *nF = count[0];
-    *nR = count[1];
-
+    if (status < -1) return *error ? -1 : ccFail(error, ccInputReadFailed);
     return 0;
 }
 
