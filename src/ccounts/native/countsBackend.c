@@ -63,6 +63,13 @@ typedef struct {
 
     double *interior;           ///< difference array for bin contributions, count + 1 slots
     double *interiorCorrection; ///< roundoff corrections for interior, or NULL
+    double *interiorTail;
+    double *interiorMass;
+    double *interiorMassCorrection;
+    double *interiorMassTail;
+    size_t *interiorEnds;
+    size_t firstInterior;
+    size_t stopInterior;
     size_t count;               ///< number of output bins
 
     ccTotals *totals;           ///< totals output, non-NULL selects totals mode
@@ -75,6 +82,25 @@ typedef struct {
     int64_t rangeStart;         ///< leftmost retained span start, -1 if none
     int64_t rangeEnd;           ///< rightmost retained span end (exclusive), 0 if none
 } ccWork;
+
+typedef struct {
+    int64_t left;
+    int64_t right;
+    const char *barcode;
+    const char *readSupport;
+} ccFragment;
+
+typedef struct {
+    uint32_t position;
+    uint32_t count;
+} ccEndpointRun;
+
+typedef struct {
+    ccEndpointRun *runs;
+    size_t size;
+    size_t capacity;
+    int unordered;
+} ccEndpointRuns;
 
 static int ccFail(const char **error, const char *message) {
     *error = message;
@@ -266,43 +292,47 @@ static int ccResolveBAM(ccSource *source, bam1_t *record, int64_t chromosomeLeng
     return event->end > event->start;
 }
 
-static int ccResolveFragment(ccSource *source, char *line, int64_t chromosomeLength,
-                              const ccOptions *options, ccEvent *event,
-                              int64_t *owner, const char **error) {
-    char *fields[6];
-    int n = ccColumns(line, fields, 6), a, b;
-    int64_t left, right, multiplicity = 1;
-
+static int ccParseFragment(char *line, ccFragment *fragment, const char **error) {
+    char *fields[5];
+    int n = ccColumns(line, fields, 5);
     if (n < 4 ||
-        ccParseCoordinate(fields[1], &left) ||
-        ccParseCoordinate(fields[2], &right) ||
-        right <= left || !*fields[3])
+        ccParseCoordinate(fields[1], &fragment->left) ||
+        ccParseCoordinate(fields[2], &fragment->right) ||
+        fragment->right <= fragment->left || !*fields[3])
         return ccFail(error, ccInvalidFile);
 
-    *owner = left;
-    if (!ccBarcodeAllowed(source, fields[3])) return 0;
+    fragment->barcode = fields[3];
+    fragment->readSupport = n == 5 ? fields[4] : NULL;
+    return 0;
+}
 
-    if (options->fragmentsUseReadSupport &&
-        (n < 5 ||
-         ccParseCoordinate(fields[4], &multiplicity) ||
-         multiplicity <= 0))
+static int ccFragmentSupport(const ccFragment *fragment, int64_t *weight,
+                             const char **error) {
+    if (!fragment->readSupport ||
+        ccParseCoordinate(fragment->readSupport, weight) || *weight <= 0)
         return ccFail(error, ccInvalidCounts);
+    return 0;
+}
+
+static int ccFragmentEvent(const ccFragment *fragment, int64_t chromosomeLength,
+                           int mode, int64_t multiplicity, ccEvent *event) {
+    int a, b;
 
     event->multiplicity = (double)multiplicity;
-    event->start = ccMax(0, left);
-    event->end = ccMin(chromosomeLength, right);
+    event->start = fragment->left;
+    event->end = ccMin(chromosomeLength, fragment->right);
     event->pointCount = 0;
 
-    if (options->countMode == 2 && event->end > event->start) {
+    if (mode == 2 && event->end > event->start) {
         event->point[0] = event->start + (event->end - event->start) / 2;
         event->pointCount = 1;
-    } else if (options->countMode == 3) {
-        event->point[0] = left;
-        event->point[1] = right - 1;
+    } else if (mode == 3) {
+        event->point[0] = fragment->left;
+        event->point[1] = fragment->right - 1;
         event->pointCount = 2;
     }
 
-    if (options->countMode >= 2 && options->countMode <= 4) {
+    if (mode >= 2 && mode <= 4) {
         a = 0;
 
         for (b = 0; b < event->pointCount; ++b) {
@@ -315,6 +345,20 @@ static int ccResolveFragment(ccSource *source, char *line, int64_t chromosomeLen
     }
 
     return event->end > event->start;
+}
+
+static int ccResolveFragment(ccSource *source, char *line, int64_t chromosomeLength,
+                              const ccOptions *options, ccEvent *event,
+                              int64_t *owner, const char **error) {
+    ccFragment fragment;
+    int64_t multiplicity = 1;
+    if (ccParseFragment(line, &fragment, error)) return -1;
+    *owner = fragment.left;
+    if (!ccBarcodeAllowed(source, fragment.barcode)) return 0;
+    if (options->fragmentsUseReadSupport &&
+        ccFragmentSupport(&fragment, &multiplicity, error)) return -1;
+    return ccFragmentEvent(&fragment, chromosomeLength, options->countMode,
+                           multiplicity, event);
 }
 
 /**
@@ -352,6 +396,22 @@ static void ccPoint(ccWork *work, const ccEvent *event) {
     }
 }
 
+static inline double ccTwoSum(double *sum, double value) {
+    double total = *sum + value;
+    double removed = total - *sum;
+    double error = (*sum - (total - removed)) + (value - removed);
+    *sum = total;
+    return error;
+}
+
+static inline void ccAccumulateWithTail(double value, double *high, double *low,
+                                        double *tail) {
+    double error = ccTwoSum(high, value);
+    if (tail) *tail += ccTwoSum(low, error);
+    else *low += error;
+    *low = ccTwoSum(high, *low);
+}
+
 /**
  * @brief Keep rounding leftovers when adding to a running total.
  *
@@ -373,16 +433,22 @@ static void ccPoint(ccWork *work, const ccEvent *event) {
  * @see Ogita, Rump and Oishi, Accurate Sum and Dot Product, Algorithm 3.1.
  */
 static void ccAccumulate(double value, double *high, double *low) {
-    double total = *high + value;
-    double removed = total - *high;
-    double error = (*high - (total - removed)) + (value - removed);
+    ccAccumulateWithTail(value, high, low, NULL);
+}
 
-    double correction = *low + error;
-    double combined = total + correction;
+enum { ccFractionalMinBins = 8 };
 
-    removed = combined - total;
-    *low = (total - (combined - removed)) + (correction - removed);
-    *high = combined;
+static inline void ccAddInterior(double *values, double *corrections, double *tails,
+                                 size_t first, size_t stop, double value) {
+    if (corrections) {
+        ccAccumulateWithTail(value, &values[first], &corrections[first],
+                             tails ? &tails[first] : NULL);
+        ccAccumulateWithTail(-value, &values[stop], &corrections[stop],
+                             tails ? &tails[stop] : NULL);
+    } else {
+        values[first] += value;
+        values[stop] -= value;
+    }
 }
 
 static void ccSpan(ccWork *work, const ccEvent *event) {
@@ -397,11 +463,12 @@ static void ccSpan(ccWork *work, const ccEvent *event) {
     last = (right - 1 - work->start) / work->binSize;
     firstFull = stopFull = first;
 
-    if (work->options->countMode == 0 || work->options->countMode == 5) {
+    int mode = work->options->countMode;
+    if (mode == 0 || mode == 5) {
         firstFull = first;
         stopFull = last + 1;
 
-        if (work->options->countMode == 0) {
+        if (mode == 0) {
             binStart = work->start + first * work->binSize;
             binEnd = ccMin(
                 work->start + (last + 1) * work->binSize, work->chromosomeLength
@@ -411,23 +478,32 @@ static void ccSpan(ccWork *work, const ccEvent *event) {
             if (right < binEnd) --stopFull;
         }
 
-        if (firstFull < stopFull) {
-            if (work->interiorCorrection) {
-                ccAccumulate(
-                    event->multiplicity, &work->interior[firstFull],
-                    &work->interiorCorrection[firstFull]
-                );
-                ccAccumulate(
-                    -event->multiplicity, &work->interior[stopFull],
-                    &work->interiorCorrection[stopFull]
-                );
-            } else {
-                work->interior[firstFull] += event->multiplicity;
-                work->interior[stopFull] -= event->multiplicity;
-            }
-        }
+        if (firstFull < stopFull)
+            ccAddInterior(work->interior, work->interiorCorrection, NULL,
+                          firstFull, stopFull, event->multiplicity);
 
-        if (work->options->countMode == 5) return;
+        if (mode == 5) return;
+    } else if (work->interiorEnds && last - first >= ccFractionalMinBins - 1) {
+        firstFull = first + (left > work->start + first * work->binSize);
+        stopFull = (right - work->start) / work->binSize;
+
+        if (stopFull - firstFull >= ccFractionalMinBins) {
+            weight = (double)work->binSize / (double)(event->end - event->start);
+            double value = event->multiplicity * weight;
+            ccAddInterior(work->interior, work->interiorCorrection, work->interiorTail,
+                          firstFull, stopFull, value);
+            if (work->interiorMass)
+                ccAddInterior(work->interiorMass, work->interiorMassCorrection,
+                              work->interiorMassTail, firstFull, stopFull, value * weight);
+
+            size_t stop = (size_t)stopFull;
+            size_t start = (size_t)firstFull;
+            if (stop > work->interiorEnds[start]) work->interiorEnds[start] = stop;
+            if (start < work->firstInterior) work->firstInterior = start;
+            if (stop > work->stopInterior) work->stopInterior = stop;
+        } else {
+            firstFull = stopFull;
+        }
     }
 
     for (j = first; j <= last; ++j) {
@@ -440,7 +516,7 @@ static void ccSpan(ccWork *work, const ccEvent *event) {
         binEnd = ccMin(binStart + work->binSize, work->chromosomeLength);
 
         weight = (double)(ccMin(right, binEnd) - ccMax(left, binStart));
-        weight /= (double)(work->options->countMode == 0 ?
+        weight /= (double)(mode == 0 ?
             binEnd - binStart : event->end - event->start);
 
         work->values[j] += event->multiplicity * weight;
@@ -857,14 +933,133 @@ int64_t ccChromosomeLength(ccSource *source, int index) {
     return source->kind == 0 ? sam_hdr_tid2len(source->header, index) : -1;
 }
 
+static int ccInitCount(ccWork *work, const char **error) {
+    int mode = work->options->countMode;
+    int fractional = mode == 1 && work->count >= ccFractionalMinBins;
+    if (mode != 0 && mode != 5 && !fractional) return 0;
+
+    int compensate = fractional || work->options->fragmentsUseReadSupport;
+    int separateMass = fractional && work->mass;
+    // Weighted spans on a fine grid can mix widely separated magnitudes
+    int extend = fractional && work->options->fragmentsUseReadSupport &&
+        work->chromosomeLength / work->binSize > (1 << 20);
+    size_t stride = work->count + 1;
+    size_t baseArrays = 1 + compensate + 2 * separateMass;
+    size_t arrays = baseArrays + extend * (1 + separateMass);
+    work->interior = calloc(stride, arrays * sizeof(double));
+    if (!work->interior) return ccFail(error, ccAllocationFailed);
+
+    if (fractional) {
+        work->interiorEnds = calloc(work->count, sizeof(*work->interiorEnds));
+        if (!work->interiorEnds) {
+            free(work->interior);
+            work->interior = NULL;
+            return ccFail(error, ccAllocationFailed);
+        }
+    }
+
+    if (compensate) work->interiorCorrection = work->interior + stride;
+    if (separateMass) {
+        work->interiorMass = work->interior + 2 * stride;
+        work->interiorMassCorrection = work->interior + 3 * stride;
+    }
+    if (extend) {
+        work->interiorTail = work->interior + baseArrays * stride;
+        if (separateMass) work->interiorMassTail = work->interiorTail + stride;
+    }
+    work->firstInterior = fractional ? work->count : 0;
+    work->stopInterior = fractional ? 0 : work->count;
+    return 0;
+}
+
+/**
+ * @brief Add span contributions to the output bins and free the scratch arrays.
+ *
+ * In a finite-difference array add the span's weight at its first bin and subtract
+ * it at its exclusive end. Use prefix sums of these changes to update counts.
+ * Recording N spans, then scanning B bins like this is O(N + B) time,
+ * whereas counting B bins for each span may be O(NB)
+ *
+ * @verbatim
+ *   bin                0           1           2           3           4           5
+ *   A (weight 2)                   [===================================)
+ *   B (weight 1)                                           [=======================)
+ *   A's changes        0          +2           0           0          -2           0
+ *   B's changes        0           0           0          +1           0          -1
+ *   difference A+B     0          +2           0          +1          -2          -1
+ *
+ *   prefix sum     0 + 0   0   0 + 2 = 2   2 + 0 = 2   2 + 1 = 3   3 - 2 = 1   1 - 1 = 0
+ *   count in bin       1           0           1           0           2           1
+ *   count += sum   1 + 0 = 1   0 + 2 = 2   1 + 2 = 3   0 + 3 = 3   2 + 1 = 3   1 + 0 = 1
+ * @endverbatim
+ *
+ * @param[in,out] work Output bins and scratch arrays for one region.
+ */
+static void ccFinishCount(ccWork *work) {
+    if (!work->interior) return;
+
+    double running = 0, correction = 0, tail = 0;
+    double mass = 0, massCorrection = 0, massTail = 0;
+    double *tailPointer = work->interiorTail ? &tail : NULL;
+    double *massTailPointer = work->interiorMassTail ? &massTail : NULL;
+    size_t coveredEnd = 0;
+
+    for (size_t bin = work->firstInterior; bin < work->stopInterior; ++bin) {
+        if (work->interiorEnds) {
+            size_t end = work->interiorEnds[bin];
+            if (end > coveredEnd) coveredEnd = end;
+            // no interior spans cover the bin
+            if (bin >= coveredEnd) {
+                running = correction = tail = 0;
+                mass = massCorrection = massTail = 0;
+                continue;
+            }
+        }
+
+        if (work->interiorCorrection) {
+            ccAccumulateWithTail(work->interior[bin], &running, &correction, tailPointer);
+            ccAccumulateWithTail(work->interiorCorrection[bin], &running, &correction,
+                                 tailPointer);
+            if (tailPointer) tail += work->interiorTail[bin];
+        } else {
+            running += work->interior[bin];
+        }
+
+
+        double contribution = running + (correction + tail);
+        work->values[bin] += contribution;
+
+        // keep small noise contributions from rounding away when large span weights cancel
+        if (work->interiorMass) {
+            ccAccumulateWithTail(work->interiorMass[bin], &mass, &massCorrection,
+                                 massTailPointer);
+            ccAccumulateWithTail(work->interiorMassCorrection[bin],
+                                 &mass, &massCorrection, massTailPointer);
+
+            if (massTailPointer) {
+                massTail += work->interiorMassTail[bin];
+            }
+
+            work->mass[bin] += mass + (massCorrection + massTail);
+
+        }
+        // FFR: do we ever actually use these?
+        else if (work->mass) {
+            work->mass[bin] += contribution;
+        }
+    }
+
+    free(work->interiorEnds);
+    free(work->interior);
+}
+
 int ccCount(ccSource *source, const char *chromosome, int64_t chromosomeLength,
             int64_t start, int64_t end, int64_t binSize, const ccOptions *options,
             double *values, double *mass, size_t count, const char **error) {
     ccWork work = {0};
     int status, tid, parsed;
     int64_t left, right, j, first, last, binStart, binEnd;
-    size_t k;
-    double value, running = 0, correction = 0, contribution;
+    double value;
     char *recordChromosome;
     kstring_t line = {0, 0, NULL};
     hts_itr_t *iterator;
@@ -913,6 +1108,7 @@ int ccCount(ccSource *source, const char *chromosome, int64_t chromosomeLength,
             for (j = first; j <= last; ++j) {
                 binStart = start + j * binSize;
                 binEnd = ccMin(binStart + binSize, chromosomeLength);
+                //
                 values[j] += value *
                     ((double)(ccMin(right, binEnd) - ccMax(left, binStart)) /
                      (double)(binEnd - binStart));
@@ -926,42 +1122,10 @@ int ccCount(ccSource *source, const char *chromosome, int64_t chromosomeLength,
         return 0;
     }
 
-    if (options->countMode == 0 || options->countMode == 5) {
-        work.interior = calloc(count + 1, sizeof(double));
-        if (!work.interior) return ccFail(error, ccAllocationFailed);
-
-        if (options->fragmentsUseReadSupport) {
-            work.interiorCorrection = calloc(count + 1, sizeof(double));
-            if (!work.interiorCorrection) {
-                free(work.interior);
-                return ccFail(error, ccAllocationFailed);
-            }
-        }
-    }
-
+    if (ccInitCount(&work, error)) return -1;
     status = ccVisit(
         source, chromosome, chromosomeLength, start, end, options, &work, 0, error);
-
-    if (work.interior) {
-        for (k = 0; k < count; ++k) {
-            if (work.interiorCorrection) {
-                ccAccumulate(work.interior[k], &running, &correction);
-                ccAccumulate(
-                    work.interiorCorrection[k], &running, &correction);
-                contribution = running + correction;
-            } else {
-                running += work.interior[k];
-                contribution = running;
-            }
-
-            values[k] += contribution;
-            if (mass) mass[k] += contribution;
-        }
-
-        free(work.interiorCorrection);
-        free(work.interior);
-    }
-
+    ccFinishCount(&work);
     return status;
 }
 
@@ -979,6 +1143,105 @@ int ccRegionTotals(ccSource *source, const char *chromosome, int64_t chromosomeL
 
     return ccVisit(
         source, chromosome, chromosomeLength, start, end, options, &work, 1, error);
+}
+
+/**
+ * @brief Scan a region ONCE for targets that share a 10x frag file
+ *
+ * Parses each row once and apply each target's barcode filter and count settings
+ */
+static void ccVisitFragmentsBatch(ccFragmentTarget *targets, ccWork *work,
+                                  size_t targetCount, const char *chromosome,
+                                  int owned) {
+    ccSource *source = targets[0].source;
+    int64_t start = work[0].start, end = work[0].end;
+    int tid = tbx_name2id(source->tabix, chromosome), status;
+    uint64_t scannedRecords = 0;
+    const char *scanError = NULL;
+    kstring_t line = {0, 0, NULL};
+    ccFragment fragment;
+    ccEvent event;
+
+    if (tid < 0) return;
+    hts_itr_t *iterator = tbx_itr_queryi(source->tabix, tid, start, end);
+
+    if (!iterator) {
+        scanError = ccInputQueryFailed;
+    } else {
+        while ((status = tbx_itr_next(source->file, source->tabix, iterator, &line)) >= 0) {
+            if (ccParseFragment(line.s, &fragment, &scanError)) break;
+
+            int inRegion = !owned || (fragment.left >= start && fragment.left < end);
+            int64_t weight = 0;
+            const char *supportError = NULL;
+            if (inRegion) ++scannedRecords;
+
+            for (size_t i = 0; i < targetCount; ++i) {
+                const ccOptions *options = work[i].options;
+                if (targets[i].error || !ccBarcodeAllowed(targets[i].source, fragment.barcode))
+                    continue;
+
+                int64_t multiplicity = 1;
+                if (options->fragmentsUseReadSupport) {
+                    if (!weight && !supportError)
+                        ccFragmentSupport(&fragment, &weight, &supportError);
+                    if (supportError) {
+                        targets[i].error = supportError;
+                        continue;
+                    }
+                    multiplicity = weight;
+                }
+
+                if (inRegion && ccFragmentEvent(&fragment, work[i].chromosomeLength,
+                                                 options->countMode, multiplicity, &event))
+                    ccConsume(&work[i], &event);
+            }
+        }
+
+        if (status < -1 && !scanError) scanError = ccInputReadFailed;
+        free(line.s);
+        hts_itr_destroy(iterator);
+    }
+
+    for (size_t i = 0; i < targetCount; ++i) {
+        if (!targets[i].error) targets[i].error = scanError;
+        if (owned) work[i].totals->scannedRecords = scannedRecords;
+    }
+}
+
+int ccFragmentsBatch(ccFragmentTarget *targets, size_t targetCount,
+                     const char *chromosome, int64_t chromosomeLength,
+                     int64_t start, int64_t end, int64_t binSize, size_t count,
+                     double *values, double *mass, ccTotals *totals, const char **error) {
+    if (!targetCount || targetCount > SIZE_MAX / sizeof(ccWork))
+        return ccFail(error, ccAllocationFailed);
+
+    ccWork *work = malloc(targetCount * sizeof(*work));
+    if (!work) return ccFail(error, ccAllocationFailed);
+
+    int status = 0;
+    size_t i;
+    for (i = 0; i < targetCount; ++i) {
+        work[i] = (ccWork){
+            .start = start, .end = end, .binSize = binSize,
+            .chromosomeLength = chromosomeLength, .options = &targets[i].options,
+            .values = values ? values + i * count : NULL,
+            .mass = mass ? mass + i * count : NULL,
+            .count = count, .totals = totals ? &totals[i] : NULL, .rangeStart = -1,
+        };
+        targets[i].error = NULL;
+        if (totals) {
+            totals[i] = (ccTotals){0};
+        } else {
+            status = ccInitCount(&work[i], error);
+            if (status) break;
+        }
+    }
+
+    if (!status) ccVisitFragmentsBatch(targets, work, targetCount, chromosome, totals != NULL);
+    if (!totals) while (i > 0) ccFinishCount(&work[--i]);
+    free(work);
+    return status;
 }
 
 int ccRegionEndpointTotal(ccSource *source, const char *chromosome,
@@ -1493,18 +1756,6 @@ int ccChromRange(ccSource *source, const char *chromosome, int64_t chromosomeLen
 
     return status;
 }
-
-typedef struct {
-    uint32_t position;
-    uint32_t count;
-} ccEndpointRun;
-
-typedef struct {
-    ccEndpointRun *runs;
-    size_t size;
-    size_t capacity;
-    int unordered;
-} ccEndpointRuns;
 
 static int ccEndpointCompare(const void *left, const void *right) {
     uint32_t a = ((const ccEndpointRun *)left)->position;

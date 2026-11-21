@@ -21,6 +21,11 @@ typedef struct {
     double eventMass;
     double spanBP;
 } ccTotals;
+typedef struct {
+    ccSource *source;
+    ccOptions options;
+    const char *error;
+} ccFragmentTarget;
 
 int ccOpen(const char *path, int kind, const char *allowPath, const char *tag,
            int threads, ccSource **out, const char **error);
@@ -34,6 +39,10 @@ int ccCount(ccSource *source, const char *chromosome, int64_t chromosomeLength,
 int ccRegionTotals(ccSource *source, const char *chromosome, int64_t chromosomeLength,
                    int64_t start, int64_t end, const ccOptions *options,
                    ccTotals *totals, const char **error);
+int ccFragmentsBatch(ccFragmentTarget *targets, size_t targetCount,
+                     const char *chromosome, int64_t chromosomeLength,
+                     int64_t start, int64_t end, int64_t binSize, size_t count,
+                     double *values, double *mass, ccTotals *totals, const char **error);
 int ccRegionEndpointTotal(ccSource *source, const char *chromosome,
                           int64_t chromosomeLength, const int64_t *regions,
                           size_t regionCount, const ccOptions *options,

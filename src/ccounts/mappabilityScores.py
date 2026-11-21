@@ -2,7 +2,7 @@ from importlib.resources import files
 
 import numpy as np
 
-from ._mappability import _intervalPrefix
+from ._mappability import _scoreIntervals
 from .checks import (
     checkedMappabilityEdges,
     checkedMappabilityIntervals,
@@ -69,29 +69,18 @@ class Mappability:
 
     def score(self, starts, ends, *, measure="multiRead"):
         starts, ends = checkedMappabilityIntervals(starts, ends, self.length, measure)
-        widths = ends - starts
-
         if measure == "singleRead":
-            positions = np.stack((starts, ends), axis=-1)
-            prefix = _intervalPrefix(
-                positions, self._coveredStarts, self._coveredEnds, self._coveredTotals
+            return _scoreIntervals(
+                starts, ends, self._coveredStarts, self._coveredEnds, self._coveredTotals
             )
-            return (prefix[..., 1] - prefix[..., 0]) / widths
 
-        if measure == "meanMultiRead":
-            positions = np.stack(
-                (starts, starts - self.k, ends, ends - self.k), axis=-1
-            )
-            prefix = _intervalPrefix(
-                positions, self._starts, self._ends, self._totals, self._moments
-            )
-            return (
-                prefix[..., 2] - prefix[..., 3] - prefix[..., 0] + prefix[..., 1]
-            ) / (self.k * widths)
-
-        positions = np.stack(
-            (starts - (self.k - 1) if measure == "multiRead" else starts, ends), axis=-1
+        return _scoreIntervals(
+            starts,
+            ends,
+            self._starts,
+            self._ends,
+            self._totals,
+            startShift=self.k - 1 if measure == "multiRead" else 0,
+            moments=self._moments if measure == "meanMultiRead" else None,
+            k=self.k,
         )
-        prefix = _intervalPrefix(positions, self._starts, self._ends, self._totals)
-        denominator = widths + self.k - 1 if measure == "multiRead" else widths
-        return (prefix[..., 1] - prefix[..., 0]) / denominator

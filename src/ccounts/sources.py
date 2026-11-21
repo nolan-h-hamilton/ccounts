@@ -341,7 +341,7 @@ class SourceSpec:
             object.__setattr__(self, "selection", frozenset(_cellIDs(self.selection)))
 
 
-def _metadataCatalog(selection):
+def _metadataCatalog(selection, h5adObs=None):
     path = selection["path"]
     barcodeColumn = selection.get("barcodeColumn")
     sampleColumn = selection.get("sampleColumn")
@@ -356,10 +356,13 @@ def _metadataCatalog(selection):
             import h5py
             from anndata.io import read_elem
 
-            handle = handles.enter_context(h5py.File(path, "r"))
-            if "obs" not in handle:
-                raise SourceError(kind="metadata")
-            frame = read_elem(handle["obs"])
+            if h5adObs is None:
+                handle = handles.enter_context(h5py.File(path, "r"))
+                if "obs" not in handle:
+                    raise SourceError(kind="metadata")
+                frame = read_elem(handle["obs"])
+            else:
+                frame = h5adObs
             fields = tuple(frame.columns)
             if not frame.columns.is_unique:
                 raise SourceError(kind="metadata")
@@ -463,7 +466,7 @@ def _allowCells(path):
     return result
 
 
-def resolveSelection(source):
+def resolveSelection(source, *, h5adObs=None):
     """Determine which cell barcodes to keep for a source input
 
     Takes the union of the requested groups, and intersects with explicit
@@ -528,7 +531,13 @@ def resolveSelection(source):
                 raise InputError(kind="selection")
         else:
             # catalog[sample][group] = set of barcodes
-            catalog = _metadataCatalog(selection)
+            sharedObs = (
+                h5adObs
+                if h5adObs is not None
+                and Path(path).resolve() == Path(source.path).resolve()
+                else None
+            )
+            catalog = _metadataCatalog(selection, sharedObs)
             # without sampleColumn, all rows use the None sample key
             sampleValue = (
                 selection.get("sampleValue", source.sampleID)

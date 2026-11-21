@@ -98,13 +98,16 @@ class CountBlock:
         object.__setattr__(self, "noiseAvailable", tuple(available))
 
 
-class _H5ADSource:
-    def __init__(self, source, grid, selectedBarcodes):
+class _H5ADFile:
+    def __init__(self, path, grid):
         import h5py
         from anndata.io import read_elem, sparse_dataset
 
-        self.handle = h5py.File(source.path, "r")
+        self.handle = h5py.File(path, "r")
+        self.path = path
+        self.grid = grid
         self.slices = {}
+        self.indptr = None
         try:
             if (
                 "var" not in self.handle
@@ -146,44 +149,7 @@ class _H5ADSource:
                     raise InputError(kind="grid")
                 self.slices[chromosome] = (left, right)
 
-            obs = read_elem(self.handle["obs"])
-            descriptor = (
-                source.selection if isinstance(source.selection, Mapping) else {}
-            )
-            metadataPath = descriptor.get("path")
-            externalMetadata = (
-                metadataPath is not None
-                and Path(metadataPath).resolve() != Path(source.path).resolve()
-            )
-            barcodeColumn = (
-                None if externalMetadata else descriptor.get("barcodeColumn")
-            )
-            if barcodeColumn is not None and barcodeColumn not in obs:
-                raise SourceError(kind="metadata", context=barcodeColumn)
-            barcodes = obs.index if barcodeColumn is None else obs[barcodeColumn]
-            selected = np.ones(len(obs), dtype=bool)
-            sampleColumn = descriptor.get("sampleColumn")
-            if sampleColumn is not None and (
-                not externalMetadata or not barcodes.is_unique
-            ):
-                if sampleColumn not in obs:
-                    raise SourceError(kind="metadata", context=sampleColumn)
-                selected &= np.asarray(
-                    obs[sampleColumn] == descriptor.get("sampleValue", source.sampleID)
-                )
-            groups = descriptor.get("groups")
-            if groups is not None and descriptor.get("path") is None:
-                groupColumn = descriptor.get("groupColumn")
-                if groupColumn not in obs:
-                    raise SourceError(kind="metadata")
-                selected &= np.asarray(obs[groupColumn].isin(groups))
-            if selectedBarcodes is not None:
-                selected &= np.asarray(barcodes.isin(selectedBarcodes))
-            self.rows = np.flatnonzero(selected)
-            selectedIDs = _cellIDs(barcodes[selected])
-            if source.matrixRows == "pseudobulks" and self.rows.size > 1:
-                raise InputError(kind="selection")
-
+            self.obs = read_elem(self.handle["obs"])
             node = self.handle["X"]
             if isinstance(node, h5py.Dataset):
                 self.matrix = node
@@ -192,16 +158,35 @@ class _H5ADSource:
                     raise SourceError(kind="metadata")
                 self.matrix = sparse_dataset(node)
             if (
-                self.matrix.shape != (len(obs), len(frame))
+                self.matrix.shape != (len(self.obs), len(frame))
                 or self.matrix.dtype.kind not in "iuf"
             ):
                 raise InputError(kind="array")
 
-            self.selectedBarcodes = frozenset(selectedIDs)
-            self.selectedCellCount = (
-                self.rows.size if source.matrixRows == "cells" else None
-            )
-            self.grid = grid
+            if getattr(self.matrix, "format", None) == "csr":
+                self.data = node["data"]
+                self.indices = node["indices"]
+                pointers = node["indptr"]
+                if (
+                    self.data.ndim != 1
+                    or self.indices.shape != self.data.shape
+                    or self.indices.dtype.kind not in "iu"
+                    or pointers.shape != (len(self.obs) + 1,)
+                    or pointers.dtype.kind not in "iu"
+                ):
+                    raise InputError(kind="array")
+                self.indptr = np.asarray(pointers, dtype=np.int64)
+                if (
+                    self.indptr[0] != 0
+                    or self.indptr[-1] != len(self.data)
+                    or np.any(self.indptr[1:] < self.indptr[:-1])
+                ):
+                    raise InputError(kind="array")
+                self.chunkSize = (
+                    min(self.data.chunks[0], self.indices.chunks[0])
+                    if self.data.chunks and self.indices.chunks
+                    else 1
+                )
         except BaseException:
             self.handle.close()
             raise
@@ -209,18 +194,100 @@ class _H5ADSource:
     def close(self):
         self.handle.close()
 
-    def _blocks(self, chromosome, startBP, endBP):
+
+class _H5ADSource:
+    def __init__(self, source, file, selectedBarcodes):
+        self.file = file
+        self.slices = file.slices
+        self.grid = file.grid
+        self.matrix = file.matrix
+        obs = file.obs
+        descriptor = source.selection if isinstance(source.selection, Mapping) else {}
+        metadataPath = descriptor.get("path")
+        externalMetadata = (
+            metadataPath is not None and Path(metadataPath).resolve() != file.path
+        )
+        barcodeColumn = None if externalMetadata else descriptor.get("barcodeColumn")
+        if barcodeColumn is not None and barcodeColumn not in obs:
+            raise SourceError(kind="metadata", context=barcodeColumn)
+        barcodes = obs.index if barcodeColumn is None else obs[barcodeColumn]
+        selected = np.ones(len(obs), dtype=bool)
+        sampleColumn = descriptor.get("sampleColumn")
+        if sampleColumn is not None and (
+            not externalMetadata or not barcodes.is_unique
+        ):
+            if sampleColumn not in obs:
+                raise SourceError(kind="metadata", context=sampleColumn)
+            selected &= np.asarray(
+                obs[sampleColumn] == descriptor.get("sampleValue", source.sampleID)
+            )
+        groups = descriptor.get("groups")
+        if groups is not None and metadataPath is None:
+            groupColumn = descriptor.get("groupColumn")
+            if groupColumn not in obs:
+                raise SourceError(kind="metadata")
+            selected &= np.asarray(obs[groupColumn].isin(groups))
+        if selectedBarcodes is not None:
+            selected &= np.asarray(barcodes.isin(selectedBarcodes))
+        self.rows = np.flatnonzero(selected)
+        self.selectedBarcodes = frozenset(_cellIDs(barcodes[selected]))
+        if source.matrixRows == "pseudobulks" and self.rows.size > 1:
+            raise InputError(kind="selection")
+        self.selectedCellCount = (
+            self.rows.size if source.matrixRows == "cells" else None
+        )
+
+        if file.indptr is not None:
+            starts = file.indptr[self.rows]
+            stops = file.indptr[self.rows + 1]
+            nonempty = starts < stops
+            self.csrStarts, self.csrStops = starts[nonempty], stops[nonempty]
+            starts, stops = self.csrStarts, self.csrStops
+            # Include a gap only when it can share a storage chunk.
+            gaps = (starts[1:] > stops[:-1]) & (
+                starts[1:] // file.chunkSize != (stops[:-1] - 1) // file.chunkSize
+            )
+            self.csrBoundaries = np.r_[0, np.flatnonzero(gaps) + 1, starts.size]
+
+    def _columns(self, chromosome, startBP, endBP):
         if chromosome not in self.slices:
             raise SourceError(kind="missing", context=chromosome)
         base = self.slices[chromosome][0]
-        left = base + startBP // self.grid.binSizeBP
-        right = base + (endBP + self.grid.binSizeBP - 1) // self.grid.binSizeBP
+        binSize = self.grid.binSizeBP
+        return base + startBP // binSize, base + (endBP + binSize - 1) // binSize
+
+    def _csrSlabs(self):
+        starts, stops = self.csrStarts, self.csrStops
+        slabSize = 2**20
+        for first, last in zip(self.csrBoundaries[:-1], self.csrBoundaries[1:]):
+            while first < last:
+                offset = int(starts[first])
+                width = np.searchsorted(stops[first:last], offset + slabSize, side="right")
+                end = first + max(1, width)
+                limit = int(stops[end - 1])
+                for begin in range(offset, limit, slabSize):
+                    stop = min(begin + slabSize, limit)
+                    values = self.file.data[begin:stop]
+                    indices = self.file.indices[begin:stop]
+                    if values.dtype.kind == "f" and values.dtype.itemsize == 2:
+                        values = values.astype(np.float32)
+                    elif not values.dtype.isnative:
+                        values = values.astype(values.dtype.newbyteorder("="))
+                    if indices.dtype not in (np.dtype("int32"), np.dtype("int64")):
+                        indices = indices.astype(np.int64)
+
+                    if begin == offset and stop == limit:
+                        slabStarts, slabStops = starts[first:end], stops[first:end]
+                    else:
+                        # Only a single oversized row can cross this boundary.
+                        slabStarts = np.array([begin], dtype=np.int64)
+                        slabStops = np.array([stop], dtype=np.int64)
+                    yield indices, values, slabStarts, slabStops, begin
+                first = end
+
+    def _blocks(self, chromosome, startBP, endBP):
+        left, right = self._columns(chromosome, startBP, endBP)
         storage = getattr(self.matrix, "format", None)
-        if storage == "csr":
-            for rowStart in range(0, self.rows.size, 1024):
-                rows = self.rows[rowStart : rowStart + 1024]
-                yield 0, self.matrix[rows, left:right]
-            return
         for columnStart in range(left, right, 4096):
             columnEnd = min(columnStart + 4096, right)
             columns = (
@@ -245,6 +312,17 @@ class _H5ADSource:
         count = (endBP - startBP + self.grid.binSizeBP - 1) // self.grid.binSizeBP
         result = np.zeros(count, dtype=np.float64)
 
+        if self.file.indptr is not None:
+            from ._native import _aggregateH5ADCSR
+
+            left, right = self._columns(chromosome, startBP, endBP)
+            correction = None
+            for slab in self._csrSlabs():
+                correction = _aggregateH5ADCSR(*slab, left, right, result, correction, True)
+            if correction is not None:
+                result += correction
+            return result
+
         with np.errstate(over="raise", invalid="raise"):
             for offset, block in self._blocks(chromosome, startBP, endBP):
                 self._checkedValues(block)
@@ -256,13 +334,33 @@ class _H5ADSource:
     def libraryTotal(self, chromosomes):
         total = 0.0
 
-        with np.errstate(over="raise", invalid="raise"):
-            for chromosome in chromosomes:
-                for _, block in self._blocks(
-                    chromosome, 0, self.grid.chromosomeSizes[chromosome]
-                ):
-                    values = self._checkedValues(block)
-                    total += float(np.sum(values, dtype=np.float64))
+        if self.file.indptr is not None:
+            from ._native import _aggregateH5ADCSR
+
+            ranges = []
+            for left, right in sorted(
+                self.slices[chromosome] for chromosome in chromosomes
+            ):
+                if ranges and ranges[-1][1] == left:
+                    ranges[-1] = (ranges[-1][0], right)
+                else:
+                    ranges.append((left, right))
+            result = np.zeros(1, dtype=np.float64)
+            correction = None
+            for slab in self._csrSlabs():
+                for left, right in ranges:
+                    correction = _aggregateH5ADCSR(
+                        *slab, left, right, result, correction, False
+                    )
+            total = float(result[0]) + (0.0 if correction is None else correction[0])
+        else:
+            with np.errstate(over="raise", invalid="raise"):
+                for chromosome in chromosomes:
+                    for _, block in self._blocks(
+                        chromosome, 0, self.grid.chromosomeSizes[chromosome]
+                    ):
+                        values = self._checkedValues(block)
+                        total += float(np.sum(values, dtype=np.float64))
         if not np.isfinite(total):
             raise NumericalError()
 
@@ -321,6 +419,7 @@ class Reader:
             raise InputError(kind="array")
 
         self._handles = {}
+        self._h5adFiles = {}
         self._info = {}
         self._readLengthFlags = {}
         self._sourceRanges = {}
@@ -331,7 +430,14 @@ class Reader:
 
         try:
             for index, source in enumerate(self.sources):
-                selected = resolveSelection(source)
+                if source.sourceKind == "H5AD":
+                    path = Path(source.path).resolve()
+                    file = self._h5adFiles.get(path)
+                    if file is None:
+                        file = self._h5adFiles[path] = _H5ADFile(path, grid)
+                    selected = resolveSelection(source, h5adObs=file.obs)
+                else:
+                    selected = resolveSelection(source)
                 info = {
                     "path": source.path,
                     "sourceKind": source.sourceKind,
@@ -350,7 +456,7 @@ class Reader:
                     "inferenceStatus": "notRequested",
                 }
                 if source.sourceKind == "H5AD":
-                    handle = _H5ADSource(source, grid, selected)
+                    handle = _H5ADSource(source, file, selected)
                     info["selectedBarcodes"] = handle.selectedBarcodes
                     info["selectedCellCount"] = handle.selectedCellCount
                     info["chromosomeNames"] = tuple(handle.slices)
@@ -458,6 +564,8 @@ class Reader:
 
                 self._handles[source.sampleID] = handle
                 self._info[source.sampleID] = info
+            for file in self._h5adFiles.values():
+                del file.obs
             if qualityWarning is not None:
                 warnings.warn(qualityWarning, stacklevel=2)
         except BaseException:
@@ -478,8 +586,11 @@ class Reader:
     @_locked
     def close(self):
         if not self._closed:
-            for handle in self._handles.values():
-                handle.close()
+            for sampleID, handle in self._handles.items():
+                if self._sourcesByID[sampleID].sourceKind != "H5AD":
+                    handle.close()
+            for file in self._h5adFiles.values():
+                file.close()
             self._selectionDir.cleanup()
             self._closed = True
 
@@ -796,22 +907,17 @@ class Reader:
                 "inferenceStatus": info["inferenceStatus"],
             }
 
+        batches = self._fragmentBatches(selected, countOptions)
+
         def blocks():
             for chromosome, start, end in chosen:
                 values = np.empty((len(selected), width // binSize), dtype=np.float64)
-                for row, sampleID in enumerate(selected):
-                    handle = self._handles[sampleID]
-                    if self._info[sampleID]["sourceKind"] == "H5AD":
-                        values[row] = handle.count(chromosome, start, end)
-                    else:
-                        values[row] = handle.countRegion(
-                            chromosome,
-                            start,
-                            end,
-                            binSize,
-                            countOptions[sampleID],
-                            False,
-                        )[0]
+                rows = self._countRows(
+                    selected, batches, (chromosome, start, end), binSize,
+                    countOptions=countOptions,
+                )
+                for row, (counts, _) in enumerate(rows):
+                    values[row] = counts
                 yield values
 
         sampling = {
@@ -885,6 +991,63 @@ class Reader:
             info["chromosomeRanges"][chromosome] = result
         return info["chromosomeRanges"][chromosome]
 
+    def _fragmentBatches(self, samples, countOptions=None):
+        groups = {}
+        for sampleID in samples:
+            source = self._sourcesByID[sampleID]
+            if source.sourceKind == "FRAGMENTS":
+                groups.setdefault(source.path, []).append(sampleID)
+
+        batches = {}
+        for members in groups.values():
+            if len(members) < 2:
+                continue
+            handles = tuple(self._handles[sampleID] for sampleID in members)
+            if countOptions is None:
+                options = tuple(self._info[name]["countOptions"] for name in members)
+            else:
+                options = tuple(countOptions[sampleID] for sampleID in members)
+            batches.update(dict.fromkeys(members, (members, handles, options)))
+        return batches
+
+    def _countRows(
+        self, samples, batches, region, binSizeBP,
+        *, returnRawNoiseMass=False, countOptions=None,
+    ):
+        chromosome, start, end = region
+        pending = {}
+        for sampleID in samples:
+            batch = batches.get(sampleID)
+            if batch is not None:
+                if sampleID not in pending:
+                    from ._native import _fragmentsBatch
+
+                    members, handles, options = batch
+                    pending.update(
+                        zip(
+                            members,
+                            _fragmentsBatch(
+                                handles, options, *region, binSizeBP, returnRawNoiseMass
+                            ),
+                        )
+                    )
+                result = pending.pop(sampleID)
+                if isinstance(result, NativeError):
+                    raise result
+                yield result
+                continue
+
+            info = self._info[sampleID]
+            handle = self._handles[sampleID]
+            if info["sourceKind"] == "H5AD":
+                yield handle.count(chromosome, start, end), None
+            else:
+                options = (
+                    info["countOptions"] if countOptions is None else countOptions[sampleID]
+                )
+                hasNoise = returnRawNoiseMass and info["sourceKind"] in ("BAM", "FRAGMENTS")
+                yield handle.countRegion(*region, binSizeBP, options, hasNoise)
+
     @_locked
     def readRegion(
         self,
@@ -913,23 +1076,13 @@ class Reader:
         units, modes, available = [], [], []
         limit = np.finfo(self.dtype).max
 
-        for row, sampleID in enumerate(selected):
+        rows = self._countRows(
+            selected, self._fragmentBatches(selected), (chromosome, start, end),
+            self.grid.binSizeBP, returnRawNoiseMass=returnRawNoiseMass,
+        )
+        for row, (sampleID, (raw, rawNoise)) in enumerate(zip(selected, rows)):
             info = self._info[sampleID]
-            handle = self._handles[sampleID]
             hasNoise = returnRawNoiseMass and info["sourceKind"] in ("BAM", "FRAGMENTS")
-            if info["sourceKind"] == "H5AD":
-                raw = handle.count(chromosome, start, end)
-                rawNoise = None
-            else:
-                raw, rawNoise = handle.countRegion(
-                    chromosome,
-                    start,
-                    end,
-                    self.grid.binSizeBP,
-                    info["countOptions"],
-                    hasNoise,
-                )
-
             maximum = float(np.max(raw, initial=0.0))
             minimum = (
                 float(np.min(raw, initial=0.0))
@@ -1114,6 +1267,12 @@ class Reader:
                     if chromosome not in features:
                         raise SourceError(kind="missing", context=chromosome)
 
+        batches = self._fragmentBatches(
+            sampleID
+            for sampleID in samples
+            if self._info[sampleID]["selectedCellCount"] != 0
+        )
+        pending = {}
         records = {}
         for sampleID in samples:
             source = self._sourcesByID[sampleID]
@@ -1173,13 +1332,29 @@ class Reader:
                 record["eventMass"] = handle.libraryTotal(selected)
                 record["spanBP"] = None
             else:
-                for chromosome in selected:
-                    evidence = handle.totalsRegion(
-                        chromosome,
-                        0,
-                        self.grid.chromosomeSizes[chromosome],
-                        info["countOptions"],
-                    )
+                batch = batches.get(sampleID)
+                if batch is not None and sampleID not in pending:
+                    from ._native import _fragmentsBatch
+
+                    members, handles, options = batch
+                    pending.update((member, []) for member in members)
+                    for chromosome in selected:
+                        length = self.grid.chromosomeSizes[chromosome]
+                        totals = _fragmentsBatch(handles, options, chromosome, 0, length)
+                        for member, evidence in zip(members, totals):
+                            pending[member].append(evidence)
+
+                batchTotals = pending.pop(sampleID, None)
+                for index, chromosome in enumerate(selected):
+                    if batchTotals is None:
+                        length = self.grid.chromosomeSizes[chromosome]
+                        evidence = handle.totalsRegion(
+                            chromosome, 0, length, info["countOptions"]
+                        )
+                    else:
+                        evidence = batchTotals[index]
+                        if isinstance(evidence, NativeError):
+                            raise evidence
                     record["eventMass"] += evidence["eventMass"]
                     record["spanBP"] += evidence["spanBP"]
                     record["metadata"]["chromosomes"][chromosome] = evidence
