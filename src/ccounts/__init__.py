@@ -38,7 +38,7 @@ from .genomes import (
     assemblyBlacklistRanges,
 )
 
-__version__ = "0.5.0b0"
+__version__ = "0.6.0b0"
 
 __all__ = [
     "InputError",
