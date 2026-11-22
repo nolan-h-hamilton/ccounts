@@ -19,6 +19,7 @@ def testMappabilityIntervals():
                     np.ascontiguousarray(archive[chromosome].T).view("<u4").reshape(-1)
                 )
         runEnds = np.cumsum(runLengths, dtype=np.int64)
+        adjacentStart = min(length - 4, max(0, int(runEnds[0]) - 1))
         starts = np.array(
             [
                 0,
@@ -29,13 +30,16 @@ def testMappabilityIntervals():
                 50,
                 51,
                 100,
+                *range(adjacentStart, adjacentStart + 4),
                 length // 2,
                 length - 51,
                 length - 50,
                 length - 1,
             ]
         )
-        ends = starts + np.array([1, 50, 1, 97, 1, 50, 101, 300, 250, 50, 50, 1])
+        ends = starts + np.array(
+            [1, 50, 1, 97, 1, 50, 101, 300, 1, 1, 1, 1, 250, 50, 50, 1]
+        )
         expected = {
             key: []
             for key in ("multiRead", "meanMultiRead", "singleRead", "uniqueStart")
@@ -64,6 +68,7 @@ def testMappabilityIntervals():
             for queryStarts, queryEnds, queryValues in (
                 (matrixStarts, matrixEnds, matrixValues),
                 (matrixStarts.T, matrixEnds.T, matrixValues.T),
+                (matrixStarts[:, ::-1], matrixEnds[:, ::-1], matrixValues[:, ::-1]),
                 (
                     matrixStarts.astype(np.uint64),
                     matrixEnds.astype(np.uint64),

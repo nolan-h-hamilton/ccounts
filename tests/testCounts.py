@@ -383,6 +383,67 @@ def testLargeFixtureWeights(countSources, mode, name, length, expected):
 
 
 @pytest.mark.parametrize(
+    "length,endBP,binSize,spans,blockSizes",
+    [
+        (
+            257,
+            257,
+            10,
+            [(0, 150, 1), (3, 103, 2**60), (17, 139, 1), (175, 269, 5)],
+            (27, 9),
+        ),
+        (
+            2_000_000_000,
+            64,
+            1,
+            [(0, 18, 2**62), (0, 21, 1), (0, 2_000_000_000, 1)],
+            (64, 15),
+        ),
+    ],
+)
+def testFractionalOverlapLongSpans(tmp_path, length, endBP, binSize, spans, blockSizes):
+    path = tmp_path / "long.fragments.tsv"
+    path.write_text(
+        "".join(f"chr1\t{start}\t{end}\tA\t{mass}\n" for start, end, mass in spans)
+    )
+    indexed = pysam.tabix_index(str(path), preset="bed", csi=True)
+    options = cc.CountOptions(
+        countMode="conservedFractionalOverlap", fragmentsUseReadSupport=True
+    )
+    source = cc.SourceSpec(indexed, "FRAGMENTS", "s", options)
+    clipped = [(start, min(end, length), mass) for start, end, mass in spans]
+    weights = [
+        [
+            (mass, max(0, min(end, left + binSize) - max(start, left)) / (end - start))
+            for start, end, mass in clipped
+        ]
+        for left in range(0, endBP, binSize)
+    ]
+    expected = (
+        [math.fsum(mass * weight for mass, weight in row) for row in weights],
+        [math.fsum(mass * weight * weight for mass, weight in row) for row in weights],
+    )
+
+    grid = cc.GridSpec({"chr1": length}, binSize)
+    with cc.openSources([source], grid, dtype="float64") as reader:
+        for blockSize in blockSizes:
+            step = blockSize * binSize
+            blocks = [
+                reader.readRegion(
+                    "chr1", start, min(start + step, endBP), returnRawNoiseMass=True
+                )
+                for start in range(0, endBP, step)
+            ]
+            for field, reference in zip(("values", "rawNoiseMass"), expected):
+                np.testing.assert_allclose(
+                    np.concatenate([getattr(block, field) for block in blocks], axis=1),
+                    [reference],
+                    rtol=2e-15,
+                    atol=0,
+                )
+
+
+@pytest.mark.parametrize(
     "path,kind,expected",
     [
         ("eventsBAM", "BAM", (5, 115)),
